@@ -54,6 +54,28 @@ In practice, the agent behaves like a predictive assistant: it continuously form
 
 ---
 
+# 🌐 Runtime & system integration
+
+The system runs locally in a web browser as a real-time application. A Node.js server orchestrates communication between the frontend, the Python world model backend, and the avatar layer via WebSockets.
+* The browser handles UI, camera input, and user interaction
+* The Python backend performs perception, state update, prediction, and planning
+* The Node.js bridge connects to Gemini Live and LiveAvatar for speech and avatar rendering
+
+This enables a low-latency closed loop where perception, prediction, planning, and embodied feedback are continuously synchronized.
+
+End-to-end flow:
+```text
+Browser (UI + camera)
+        ⇄
+Node.js (WebSocket orchestrator)
+        ⇄
+Python world model (perception + prediction + planning)
+        ⇄
+Gemini Live + LiveAvatar (speech + avatar)
+```
+
+---
+
 # 🧠 Core idea
 
 The system learns a predictive world model in state space instead of raw pixels. By simulating future states under candidate actions, it can choose actions based on predicted outcomes, not just current observations.
@@ -198,6 +220,27 @@ node server/live-bridge.mjs
 ```bash
 npm run dev
 ```
+
+### Open the app in your web browser
+
+``` text
+http://localhost:3000
+```
+If port 3000 is already in use, Next.js will display another URL (e.g., http://localhost:3001) in the terminal.
+
+### Run the demo
+
+In the browser:
+* allow camera and microphone access
+* click Start Avatar
+* click Start Mic
+* say: “start guidance”
+
+The agent will:
+* observe the scene (using latent states)
+* predict future states
+* plan actions
+* speak guidance in real time
 
 ---
 
