@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Embodied Agent Architecture</title>
+  <desc id="desc">A clean system diagram showing perception, state, world model, planner, action policy, Gemini Live, avatar, and the environment feedback loop.</desc>
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { font: 700 34px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif; fill: #475569; }
+      .label { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif; fill: #0f172a; }
+      .small { font: 500 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif; fill: #475569; }
+      .box { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; rx: 22; ry: 22; }
+      .accent { fill: #eff6ff; stroke: #93c5fd; stroke-width: 2; rx: 22; ry: 22; }
+      .green { fill: #f0fdf4; stroke: #86efac; stroke-width: 2; rx: 22; ry: 22; }
+      .purple { fill: #faf5ff; stroke: #d8b4fe; stroke-width: 2; rx: 22; ry: 22; }
+      .orange { fill: #fff7ed; stroke: #fdba74; stroke-width: 2; rx: 22; ry: 22; }
+      .line { stroke: #64748b; stroke-width: 3; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+      .loop { stroke: #94a3b8; stroke-width: 3; fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 8 8; }
+      .pill { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1.5; rx: 999; ry: 999; }
+      .pilltext { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif; fill: #334155; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowLight" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="900"/>
+
+  <text class="title" x="80" y="90">Embodied Agent Architecture</text>
+  <text class="subtitle" x="80" y="125">A lightweight world model for real-time goal-directed control in an embodied agent</text>
+
+  <!-- Top row -->
+  <rect class="box" x="80" y="210" width="220" height="120"/>
+  <text class="label" x="190" y="258" text-anchor="middle">Camera / Audio</text>
+  <text class="small" x="190" y="288" text-anchor="middle">live observations</text>
+
+  <rect class="accent" x="370" y="190" width="270" height="160"/>
+  <text class="label" x="505" y="248" text-anchor="middle">Perception Encoder</text>
+  <text class="small" x="505" y="278" text-anchor="middle">YOLO + DINO</text>
+  <text class="small" x="505" y="304" text-anchor="middle">geometry + appearance</text>
+
+  <rect class="accent" x="720" y="190" width="250" height="160"/>
+  <text class="label" x="845" y="248" text-anchor="middle">State / Belief</text>
+  <text class="small" x="845" y="278" text-anchor="middle">x, y, vx, vy, z</text>
+  <text class="small" x="845" y="304" text-anchor="middle">task + uncertainty</text>
+
+  <rect class="purple" x="1050" y="190" width="280" height="160"/>
+  <text class="label" x="1190" y="248" text-anchor="middle">World Model</text>
+  <text class="small" x="1190" y="278" text-anchor="middle">Dynamics MLP</text>
+  <text class="small" x="1190" y="304" text-anchor="middle">(sₜ, aₜ) → sₜ₊₁</text>
+
+  <!-- Bottom row -->
+  <rect class="purple" x="240" y="520" width="290" height="160"/>
+  <text class="label" x="385" y="578" text-anchor="middle">Planner</text>
+  <text class="small" x="385" y="608" text-anchor="middle">1-step / 2-step rollouts</text>
+  <text class="small" x="385" y="634" text-anchor="middle">future scoring</text>
+
+  <rect class="green" x="610" y="520" width="240" height="160"/>
+  <text class="label" x="730" y="578" text-anchor="middle">Action Policy</text>
+  <text class="small" x="730" y="608" text-anchor="middle">left · right · up</text>
+  <text class="small" x="730" y="634" text-anchor="middle">down · wait · stop</text>
+
+  <rect class="orange" x="930" y="520" width="250" height="160"/>
+  <text class="label" x="1055" y="578" text-anchor="middle">Gemini Live</text>
+  <text class="small" x="1055" y="608" text-anchor="middle">speech generation</text>
+  <text class="small" x="1055" y="634" text-anchor="middle">realtime bridge</text>
+
+  <rect class="green" x="1260" y="520" width="220" height="160"/>
+  <text class="label" x="1370" y="578" text-anchor="middle">Avatar</text>
+  <text class="small" x="1370" y="608" text-anchor="middle">spoken guidance</text>
+  <text class="small" x="1370" y="634" text-anchor="middle">embodied output</text>
+
+  <!-- Environment -->
+  <rect class="box" x="1260" y="740" width="220" height="100"/>
+  <text class="label" x="1370" y="797" text-anchor="middle">Environment</text>
+
+  <!-- Arrows -->
+  <path class="line" d="M 300 270 H 370" marker-end="url(#arrow)"/>
+  <path class="line" d="M 640 270 H 720" marker-end="url(#arrow)"/>
+  <path class="line" d="M 970 270 H 1050" marker-end="url(#arrow)"/>
+
+  <path class="line" d="M 1190 350 V 430 H 385 V 520" marker-end="url(#arrow)"/>
+  <path class="line" d="M 530 600 H 610" marker-end="url(#arrow)"/>
+  <path class="line" d="M 850 600 H 930" marker-end="url(#arrow)"/>
+  <path class="line" d="M 1180 600 H 1260" marker-end="url(#arrow)"/>
+  <path class="line" d="M 1370 680 V 740" marker-end="url(#arrow)"/>
+
+  <!-- Feedback loop -->
+  <path class="loop" d="M 1260 790 H 90 V 350" marker-end="url(#arrowLight)"/>
+  <text class="small" x="165" y="382">visual feedback loop</text>
+
+  <!-- Formula pills -->
+  <rect class="pill" x="1115" y="390" width="150" height="34"/>
+  <text class="pilltext" x="1190" y="412" text-anchor="middle">continuous prediction</text>
+
+  <rect class="pill" x="300" y="445" width="170" height="34"/>
+  <text class="pilltext" x="385" y="467" text-anchor="middle">goal-directed planning</text>
+
+  <rect class="pill" x="661" y="445" width="138" height="34"/>
+  <text class="pilltext" x="730" y="467" text-anchor="middle">discrete actions</text>
+
+  <!-- Footer note -->
+  <text class="small" x="80" y="860">Frontend: Next.js UI + avatar + camera · Backend: Python world model · Bridge: Gemini Live</text>
+</svg>
