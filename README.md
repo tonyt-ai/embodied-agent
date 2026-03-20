@@ -236,7 +236,7 @@ python world_model/server.py
 ### Start Gemini bridge
 
 ```bash
-export GEMINI_API_KEY=your_key
+$env:GEMINI_API_KEY="your_key" (WIN)   or   export GEMINI_API_KEY=your_key
 node server/live-bridge.mjs
 ```
 
