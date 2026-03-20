@@ -160,6 +160,65 @@ pip install -r requirements.txt
 npm install
 ```
 
+---
+
+# 🔑 API Keys (Required)
+
+This project requires access to Gemini API and LiveAvatar API for speech and avatar rendering.
+
+Required services
+	•	Google Gemini API (speech + LLM)
+	•	LiveAvatar API (real-time avatar rendering)
+
+---
+
+1. Gemini API key
+
+Get an API key from Google AI Studio.
+Set it as an environment variable:
+```bash
+export GEMINI_API_KEY=your_key
+```
+
+---
+
+2. LiveAvatar API key
+
+Set your LiveAvatar credentials (used by the Next.js API route):
+```bash
+export LIVEAVATAR_API_KEY=your_key
+```
+Depending on your setup, you may also need to configure it inside:
+```bash
+app/api/liveavatar/session/route.ts
+```
+---
+
+3. Optional: .env (recommended)
+
+You can store everything in a .env file:
+```bash
+GEMINI_API_KEY=your_key
+LIVEAVATAR_API_KEY=your_key
+```
+Then load it (Next.js + Node will pick it up automatically if configured).
+
+---
+
+⚠️ Notes
+	•	These APIs are required for:
+	•	real-time speech generation
+	•	avatar animation
+	•	The world model backend can run independently, but the full embodied experience requires both APIs
+
+---
+
+🧠 Tip
+
+If you just want to test the world model:
+	•	you can bypass Gemini + LiveAvatar
+	•	and log actions directly in the backend
+
 ### Start backend
 
 ```bash
