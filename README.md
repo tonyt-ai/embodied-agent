@@ -159,6 +159,24 @@ embodied-agent/
 pip install -r requirements.txt
 npm install
 ```
+### Start backend
+
+```bash
+python world_model/server.py
+```
+
+### Start Gemini bridge
+
+```bash
+export GEMINI_API_KEY=your_key
+node server/live-bridge.mjs
+```
+
+### Start frontend
+
+```bash
+npm run dev
+```
 
 ---
 
@@ -218,25 +236,6 @@ Then load it (Next.js + Node will pick it up automatically if configured).
 If you just want to test the world model:
 	•	you can bypass Gemini + LiveAvatar
 	•	and log actions directly in the backend
-
-### Start backend
-
-```bash
-python world_model/server.py
-```
-
-### Start Gemini bridge
-
-```bash
-export GEMINI_API_KEY=your_key
-node server/live-bridge.mjs
-```
-
-### Start frontend
-
-```bash
-npm run dev
-```
 
 ---
 
