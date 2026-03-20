@@ -15,9 +15,20 @@
 
 # ✨ Abstract
 
-We present a lightweight embodied agent that performs real-time, goal-directed behavior through continuous prediction in a learned world model. The system encodes multimodal observations into a compact state, maintains a belief over the environment, and predicts future states under candidate actions. A simple planner evaluates these imagined futures to select actions that reduce uncertainty and maximize progress toward the goal.
+This project implements a lightweight, explicit world model: a compact state representation combined with a learned action-conditioned dynamics model that predicts short-horizon futures and enables rollout-based planning. It does not attempt to learn representations end-to-end (e.g. JEPA-style), but instead builds on frozen perceptual features (DINOv2) and focuses on predictive dynamics and control.
 
-Unlike reactive multimodal assistants, this system explicitly models counterfactual outcomes and maintains structured beliefs over object locations and task state. This enables reasoning under partial observability, informative action selection, and grounded explanations through language.
+Unlike reactive multimodal assistants, this system explicitly models counterfactual outcomes and maintains a persistent structured state over object locations and task context, acting as a lightweight belief over the environment. This enables reasoning under partial observability, informative action selection, and grounded explanations through language.
+
+### ❌ What this is not
+
+This is not:
+* a fully learned latent world model (e.g. JEPA-style end-to-end training)
+* a probabilistic belief-state model
+* long-horizon planning or general environment simulation
+* trained on large-scale video datasets
+
+Instead, this is a **minimal, real-time, interpretable world model prototype** focused on action-conditioned prediction and control.
+This demonstrates that even small systems can exhibit core properties of world models—prediction, counterfactual reasoning, and goal-directed control—without requiring large-scale training.
 
 ---
 
@@ -28,6 +39,11 @@ This is the minimal closed-loop required for embodied intelligence:
 perception → state → prediction → planning → action → speech
 ```
 The agent observes the world, compresses it into a state, predicts how it evolves under actions, plans using those predictions, acts, and communicates the result.
+The core of the system follows a standard world model formulation:
+```text
+s_{t+1} = f(s_t, a_t)
+```
+where s_t is the current state (including geometric and visual features), and a_t is the chosen action.
 
 ---
 
@@ -74,6 +90,12 @@ Python world model (perception + prediction + planning)
 Gemini Live + LiveAvatar (speech + avatar)
 ```
 
+Design choices prioritize:
+* real-time performance
+* simplicity and debuggability
+* modularity (separating perception, dynamics, and planning)
+rather than end-to-end training complexity.
+
 ---
 
 # 🧠 Core idea
@@ -104,12 +126,13 @@ Perception extracts both geometry (where) and appearance (what) to build a compa
 * YOLO → object detection
 * DINOv2 → appearance embedding
 
-## State
+## State (world representation)
 
 The state is a low-dimensional abstraction of the scene, combining position, motion, and appearance into a form suitable for prediction and planning:
 ```python
 state = [x, y, vx, vy, z]
 ```
+The model operates not only on geometric state (position, velocity) but also on learned visual representations from DINOv2, allowing the dynamics model to reason in a semantically meaningful feature space rather than raw pixels. This brings the system closer to latent world model approaches, while keeping the representation frozen for efficiency and simplicity.
 
 ## Dynamics
 
@@ -119,10 +142,12 @@ The dynamics model learns how the world evolves under actions, enabling counterf
 
 ## Planning
 
-The planner evaluates multiple imagined futures and selects the action that maximizes expected progress toward the goal. Even short rollouts already enable non-trivial behavior:
+The planner evaluates multiple imagined futures and selects the action that maximizes expected progress toward the goal. Even short rollouts al enable non-trivial behavior.
+At each step, the system simulates multiple candidate futures by rolling out the learned dynamics model under different actions, and selects actions by scoring these predicted trajectories relative to the goal:
 * discrete action set
 * 2-step rollout
 * value-based selection
+This enables counterfactual reasoning: evaluating “what would happen if I take action A vs B” before acting.
 
 ## Embodiment
 
@@ -137,11 +162,11 @@ The agent’s internal decision is exposed through speech and avatar, making its
 
 Example of usage:
 * AI mode + Use Avatar Speech
-* Start avatar + Start mic: Gemini Live and LiveAvatar will start, the AI agent will appear (on the left).
+* Start avatar + Start mic: Gemini Live and LiveAvatar will start, the agent will appear (on the left).
 * A live video stream of the scene is shown in real time (on the right): e.g., a cup on a desk.
-* Talk to the Gemini Live AI agent ("Hello..."). We ready, say: "Start guidance!"
-* The AI agent will provide guidance ("up", "down", etc.) as the object is moved towards the goal.
-* When the goal is reached (e.g., cup at center of image), the AI agent says "stop".
+* Talk to the Gemini Live agent ("Hello..."). We ready, say: "Start guidance!"
+* The agent will provide guidance ("up", "down", etc.) as the object is moved towards the goal.
+* When the goal is reached (e.g., cup at center of image), the agent says "stop".
 
 ---
 
@@ -314,7 +339,7 @@ python world_model/train_dynamics.py
 # ⚠️ Limitations
 
 These limitations are intentional and reflect the focus on minimality and clarity:
-* short planning horizon (2-step)
+* short planning horizon (2-step) for simplicity and real-time performance
 * single-object focus
 * no long-term memory
 * no learned reward
@@ -339,7 +364,7 @@ Natural extensions toward more general embodied intelligence:
 
 ---
 
-📚 References
+# 📚 References
 
 This project is inspired by recent work on predictive world models, representation learning, and embodied agents:
 
