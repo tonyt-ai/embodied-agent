@@ -154,6 +154,9 @@ export default function Home() {
   const [outputTranscript, setOutputTranscript] = useState("");
   const [directAudioMonitor, setDirectAudioMonitor] = useState(false);
 
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
+
   const worldModelWsRef = useRef<WebSocket | null>(null);
   const localCamRef = useRef<HTMLVideoElement>(null);
   const localCamStreamRef = useRef<MediaStream | null>(null);
@@ -735,13 +738,34 @@ export default function Home() {
     setStatus(mode === "ai" ? "Mic off (AI mode)" : "Mic off (Direct mode)");
   }
 
+  async function loadVideoDevices() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter((d) => d.kind === "videoinput");
+    setVideoDevices(cams);
+
+    if (cams.length > 0 && !selectedCameraId) {
+      setSelectedCameraId(cams[0].deviceId);
+    }
+  }
+
   async function startLocalCamera() {
+    // First call to unlock labels
+    const initialStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: false,
+    });
+
+    // Now we can list devices with labels
+    await loadVideoDevices();
+
+    // Stop initial stream
+    initialStream.getTracks().forEach((t) => t.stop());
+
+    // Start with selected camera
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: 640,
-        height: 360,
-        facingMode: "user",
-      },
+      video: selectedCameraId
+        ? { deviceId: { exact: selectedCameraId } }
+        : true,
       audio: false,
     });
 
@@ -922,6 +946,15 @@ export default function Home() {
       connectGeminiBridge();
     }
   }, [useAvatarSpeech]);
+
+  useEffect(() => {
+    if (!selectedCameraId) return;
+
+    if (localCamStreamRef.current) {
+      stopLocalCamera();
+      startLocalCamera();
+    }
+  }, [selectedCameraId]);
 
   useEffect(() => {
     return () => {
@@ -1169,6 +1202,19 @@ export default function Home() {
                   <button onClick={askSimulateActions} style={actionButtonStyle("secondary")}>
                     Simulate futures
                   </button>
+                </div>
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ marginRight: 8 }}>Camera:</label>
+                  <select
+                    value={selectedCameraId || ""}
+                    onChange={(e) => setSelectedCameraId(e.target.value)}
+                  >
+                    {videoDevices.map((cam, i) => (
+                      <option key={cam.deviceId} value={cam.deviceId}>
+                        {cam.label || `Camera ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
             </div>
