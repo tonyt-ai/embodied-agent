@@ -9,7 +9,7 @@
   <img alt="Embodied AI" src="https://img.shields.io/badge/Embodied-AI-34d399">
 </p>
 
-> A minimal real-time agent that **sees**, **predicts**, **plans**, and **speaks**.
+> A minimal real-time agent that **sees**, **predicts**, **plans**, and **speaks**. It learns how the world evolves from its own observations and uses that knowledge to act.
 
 ---
 
@@ -23,9 +23,11 @@ Unlike reactive multimodal assistants, this system explicitly models counterfact
 
 # 🔁 Core loop
 
+This is the minimal closed-loop required for embodied intelligence:
 ```text
 perception → state → prediction → planning → action → speech
 ```
+The agent observes the world, compresses it into a state, predicts how it evolves under actions, plans using those predictions, acts, and communicates the result.
 
 ---
 
@@ -37,19 +39,24 @@ perception → state → prediction → planning → action → speech
 
 # 🚀 What the system does
 
-* streams live camera input
-* detects and tracks objects (YOLO)
-* builds a compact state (geometry + appearance)
-* predicts future states under actions
-* plans with **2-step rollouts**
-* selects an action (`left`, `right`, `up`, `down`, `wait`, `stop`)
-* speaks via **Gemini Live + avatar**
+The system runs a **real-time embodied predictive control loop**, where behavior emerges from prediction and planning rather than reactive rules:
 
-Result: a **real-time predictive control loop**.
+* observes the scene through a live camera (e.g., a cup on a desk)
+* detects and tracks a target object (YOLO)
+* builds a compact state (position, motion, appearance with DINOv2)
+* predicts how the scene evolves under candidate actions
+* simulates short future trajectories (2-step rollouts)
+* selects the action (`left`, `right`, `up`, `down`, `wait`, `stop`) that best moves toward the goal (e.g., center of camera image)
+* communicates the decision through a speaking avatar via **Gemini Live + LiveAvatar** as the object moves
+* stops when the goal is reached
+
+In practice, the agent behaves like a predictive assistant: it continuously forms hypotheses about the world, tests them through imagined futures, and acts on the most promising one.
 
 ---
 
 # 🧠 Core idea
+
+The system learns a predictive world model in state space instead of raw pixels. By simulating future states under candidate actions, it can choose actions based on predicted outcomes, not just current observations.
 
 ```text
 f(s_t, a_t) → s_{t+1}
@@ -62,7 +69,8 @@ Planner:
 (s_{t+1}, a2) → s_{t+2}
 ```
 
-Select best first action.
+Selects and communicates the best first action.
+This differs from reactive agents by explicitly predicting and evaluating future states before acting.
 
 ---
 
@@ -70,28 +78,33 @@ Select best first action.
 
 ## Perception
 
+Perception extracts both geometry (where) and appearance (what) to build a compact, learnable state:
 * YOLO → object detection
 * DINOv2 → appearance embedding
 
 ## State
 
+The state is a low-dimensional abstraction of the scene, combining position, motion, and appearance into a form suitable for prediction and planning:
 ```python
 state = [x, y, vx, vy, z]
 ```
 
 ## Dynamics
 
+The dynamics model learns how the world evolves under actions, enabling counterfactual reasoning (“what happens if I do this?”):
 * MLP transition model
 * trained from self-collected transitions
 
 ## Planning
 
+The planner evaluates multiple imagined futures and selects the action that maximizes expected progress toward the goal. Even short rollouts already enable non-trivial behavior:
 * discrete action set
 * 2-step rollout
 * value-based selection
 
 ## Embodiment
 
+The agent’s internal decision is exposed through speech and avatar, making its reasoning observable and interactive:
 * action → Gemini Live → avatar speech
 
 ---
@@ -99,6 +112,14 @@ state = [x, y, vx, vy, z]
 # 🖥️ Demo UI
 
 ![Demo UI](./public/demo-ui.png)
+
+Example of usage:
+* AI mode + Use Avatar Speech
+* Start avatar + Start mic: Gemini Live and LiveAvatar will start, the AI agent will appear (on the left).
+* A live video stream of the scene is shown in real time (on the right): e.g., a cup on a desk.
+* Talk to the Gemini Live AI agent ("Hello..."). We ready, say: "Start guidance!"
+* The AI agent will provide guidance ("up", "down", etc.) as the object is moved towards the goal.
+* When the goal is reached (e.g., cup at center of image), the AI agent says "stop".
 
 ---
 
@@ -180,51 +201,30 @@ npm run dev
 
 ---
 
-# 🔑 API Keys (Required)
+# 🔑 API Keys
 
 This project requires access to Gemini API and LiveAvatar API for speech and avatar rendering.
+Required services:
+* Google Gemini API (speech + LLM): https://ai.google.dev/gemini-api/docs/live-api
+* LiveAvatar API (real-time avatar rendering): https://www.liveavatar.com/
 
-Required services
-	•	Google Gemini API (speech + LLM)
-	•	LiveAvatar API (real-time avatar rendering)
-
----
-
-1. Gemini API key
-
-Get an API key from Google AI Studio.
-Set it as an environment variable:
-```bash
-export GEMINI_API_KEY=your_key
-```
-
----
-
-2. LiveAvatar API key
-
-Set your LiveAvatar credentials (used by the Next.js API route):
-```bash
-export LIVEAVATAR_API_KEY=your_key
-```
-Depending on your setup, you may also need to configure it inside:
-```bash
-app/api/liveavatar/session/route.ts
-```
----
-
-3. Optional: .env (recommended)
-
-You can store everything in a .env file:
+These APIs enable the embodied interface layer (speech + avatar). The world model itself runs independently.
+You can store everything in a .env.local file placed in the root directory:
 ```bash
 GEMINI_API_KEY=your_key
 LIVEAVATAR_API_KEY=your_key
 ```
-Then load it (Next.js + Node will pick it up automatically if configured).
+In addtion:
+* Set the LiveAvatar  avatar_id  in app/api/liveavatar/session/route.ts
+* Set the Gemini Live  voiceName  in server/live-bridge.mjs 
+
+The configuration will be picked up automatically.
 
 ---
 
 ⚠️ Notes
-	•	These APIs are required for:
+
+These APIs are required for:
 	•	real-time speech generation
 	•	avatar animation
 	•	The world model backend can run independently, but the full embodied experience requires both APIs
@@ -233,14 +233,35 @@ Then load it (Next.js + Node will pick it up automatically if configured).
 
 🧠 Tip
 
-If you just want to test the world model:
-	•	you can bypass Gemini + LiveAvatar
-	•	and log actions directly in the backend
+If you just want to test the world model you can bypass Gemini Live + LiveAvatar (see UI).
 
 ---
 
-# 📊 Training
+# 📊 Data collection & training
 
+### Data collection
+
+Training data is collected online from real observations, without manual labeling:
+* the system observes object motion over time
+* infers the effective action (e.g., left/right/up/down) from displacement
+* constructs transitions:
+```json
+{
+  "state": s_t,
+  "action": a_t,
+  "next_state": s_{t+1}
+}
+```
+In world_model/ , set True before capture and revert to False after:
+```bash
+COLLECT_TRANSITIONS = True
+```
+This produces a dataset of self-collected trajectories directly aligned with the task. Data is saved in world_model/data/transitions.jsonl. The dataset can be further filtered using the clean_transitions.py script.
+
+### Training
+
+The model is trained on self-collected transitions (state, action, next_state), allowing it to learn directly from continuous real observations without manual labels.
+After data collection, train the prediction model by running:
 ```bash
 python world_model/train_dynamics.py
 ```
@@ -249,6 +270,7 @@ python world_model/train_dynamics.py
 
 # ⚠️ Limitations
 
+These limitations are intentional and reflect the focus on minimality and clarity:
 * short planning horizon (2-step)
 * single-object focus
 * no long-term memory
@@ -259,6 +281,7 @@ python world_model/train_dynamics.py
 
 # 🔭 Next steps
 
+Natural extensions toward more general embodied intelligence:
 * longer-horizon planning
 * richer latent state
 * multi-object reasoning
@@ -270,6 +293,30 @@ python world_model/train_dynamics.py
 # 💡 Key insight
 
 > A small system can already combine perception, prediction, planning, and language into a real-time embodied loop.
+
+---
+
+📚 References
+
+This project is inspired by recent work on predictive world models, representation learning, and embodied agents:
+
+[1] Self-Supervised Learning with Joint-Embedding Predictive Architectures.
+Y. LeCun, 2022
+
+[2] Video Joint Embedding Predictive Architecture (V-JEPA).
+Meta AI, 2023
+
+[3] V-JEPA 2.
+Meta AI, 2024
+
+[4] Embodied AI Agents: Modeling the World.
+P. Fung et al., Meta AI, 2025
+
+[5] DreamerV3: Mastering Diverse Domains through World Models.
+D. Hafner et al., 2023
+
+[6] Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model (MuZero).
+J. Schrittwieser et al., 2020
 
 ---
 
