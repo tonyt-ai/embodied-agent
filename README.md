@@ -157,8 +157,8 @@ The agent’s internal decision is exposed through speech and avatar, making its
 ---
 
 # 🖥️ Demo
-Click on the image to see a video:
-[![Demo](./public/demo-ui.png)](./public/demo_video.mp4)
+![Demo](./public/demo-ui.png)
+https://youtu.be/xqM3ZvzW6Xk
 
 Example of usage:
 * AI mode + Use Avatar Speech
