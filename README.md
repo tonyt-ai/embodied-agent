@@ -13,13 +13,11 @@
 
 ---
 
-# ✨ Abstract
+# ✨ Introduction
 
 This project implements a lightweight, explicit world model: a compact state representation combined with a learned action-conditioned dynamics model that predicts short-horizon futures and enables rollout-based planning. It does not attempt to learn representations end-to-end (e.g. JEPA-style), but instead builds on frozen perceptual features (DINOv2) and focuses on predictive dynamics and control.
 
 Unlike reactive multimodal assistants, this system explicitly models counterfactual outcomes and maintains a persistent structured state over object locations and task context, acting as a lightweight belief over the environment. This enables reasoning under partial observability, informative action selection, and grounded explanations through language.
-
-### ❌ What this is not
 
 This is not:
 * a fully learned latent world model (e.g. JEPA-style end-to-end training)
@@ -29,6 +27,8 @@ This is not:
 
 Instead, this is a **minimal, real-time, interpretable world model prototype** focused on action-conditioned prediction and control.
 This demonstrates that even small systems can exhibit core properties of world models—prediction, counterfactual reasoning, and goal-directed control—without requiring large-scale training.
+
+Such an embodied agent has numerous applications, including tele-assistance and tele-health, where it can provide tailored, real-time guidance for everyday tasks (e.g., bringing milk to the fridge or placing plates in the sink), enabling more autonomous and assisted daily living.
 
 ---
 
