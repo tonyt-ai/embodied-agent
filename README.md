@@ -142,11 +142,12 @@ The dynamics model learns how the world evolves under actions, enabling counterf
 
 ## Planning
 
-The planner evaluates multiple imagined futures and selects the action that maximizes expected progress toward the goal. Even short rollouts al enable non-trivial behavior.
+The planner evaluates multiple imagined futures and selects the action that maximizes expected progress toward the goal. Even short rollouts enable non-trivial behavior.
 At each step, the system simulates multiple candidate futures by rolling out the learned dynamics model under different actions, and selects actions by scoring these predicted trajectories relative to the goal:
 * discrete action set
 * 2-step rollout
 * value-based selection
+
 This enables counterfactual reasoning: evaluating “what would happen if I take action A vs B” before acting.
 
 ## Embodiment
@@ -348,14 +349,6 @@ Server detect:     ~8–10 ms
 Server total:      ~9–12 ms
 Pipeline latency:  ~10–15 ms
 ```
-### Breakdown
-
-* Capture: frame acquisition and encoding in the browser
-* Server decode: base64 → image reconstruction
-* Server detect: YOLO inference (dominant cost)
-* Server total: full backend processing (detection + state update)
-* Pipeline latency: end-to-end round-trip latency
-
 ### Observations
 * The system runs at ~80–100 FPS equivalent latency
 * YOLO inference dominates compute (~80%)
