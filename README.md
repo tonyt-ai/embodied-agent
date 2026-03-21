@@ -164,7 +164,7 @@ Example of usage:
 * AI mode + Use Avatar Speech
 * Start avatar + Start mic: Gemini Live and LiveAvatar will start, the agent will appear (on the left).
 * A live video stream of the scene is shown in real time (on the right): e.g., a cup on a desk.
-* Talk to the Gemini Live agent ("Hello..."). We ready, say: "Start guidance!"
+* Talk to the Gemini Live agent ("Hello..."). When ready, say: "Start guidance!"
 * The agent will provide guidance ("up", "down", etc.) as the object is moved towards the goal.
 * When the goal is reached (e.g., cup at center of image), the agent says "stop".
 
