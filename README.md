@@ -28,7 +28,7 @@ This is not:
 Instead, this is a **minimal, real-time, interpretable world model prototype** focused on action-conditioned prediction and control.
 This demonstrates that even small systems can exhibit core properties of world models—prediction, counterfactual reasoning, and goal-directed control—without requiring large-scale training.
 
-Such an embodied agent has numerous applications, including tele-assistance and tele-health, where it can provide tailored, real-time guidance for everyday tasks (e.g., bringing milk to the fridge or placing plates in the sink), enabling more autonomous and assisted daily living.
+World-grounded embodied agents have numerous applications, including tele-assistance and tele-health, where they can provide tailored, real-time guidance for everyday tasks (e.g., bringing milk to the fridge or placing plates in the sink), enabling more autonomous daily living.
 
 ---
 
