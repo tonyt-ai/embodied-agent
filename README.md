@@ -293,9 +293,10 @@ The configuration will be picked up automatically.
 ⚠️ Notes
 
 These APIs are required for:
-	•	real-time speech generation
-	•	avatar animation
-	•	The world model backend can run independently, but the full embodied experience requires both APIs
+* real-time speech generation
+* avatar animation
+
+The world model backend can run independently, but the full embodied experience requires both APIs.
 
 ---
 
@@ -313,17 +314,18 @@ Training data is collected online from real observations, without manual labelin
 * the system observes object motion over time
 * infers the effective action (e.g., left/right/up/down) from displacement
 * constructs transitions:
-```json
+```text
 {
   "state": s_t,
   "action": a_t,
   "next_state": s_{t+1}
 }
 ```
-In world_model/ , set True before capture and revert to False after:
+To capture data, run the backend with the --capture flag:
 ```bash
-COLLECT_TRANSITIONS = True
+python server.py --capture
 ```
+Then start "World model only" mode, with the camera pointing to the scene with the object (e.g., a cup) to move around.
 This produces a dataset of self-collected trajectories directly aligned with the task. Data is saved in world_model/data/transitions.jsonl. The dataset can be further filtered using the clean_transitions.py script.
 
 ### Training

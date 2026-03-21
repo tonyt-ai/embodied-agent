@@ -8,22 +8,22 @@ exposes a simple query API (e.g. `simulate_actions`) that uses a
 learned dynamics model to simulate short rollouts.
 """
 
-import json
+import argparse
 import asyncio
-import websockets
 import base64
 import cv2
-import numpy as np
+import json
 import math
-import time
+import numpy as np
 import os
-from pathlib import Path
+import time
+import websockets
 
-from ultralytics import YOLO
-
-from world_state import WorldState
-from planner import simulate_all_actions
 from dino_encoder import encode_bbox
+from pathlib import Path
+from planner import simulate_all_actions
+from ultralytics import YOLO
+from world_state import WorldState
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -40,7 +40,11 @@ model = YOLO(YOLO_MODEL_PATH)
 TRANSITIONS_FILE = os.path.join(DATA_DIR, "transitions.jsonl")
 
 # Runtime flags and DINO configuration
-COLLECT_TRANSITIONS = False
+parser = argparse.ArgumentParser()
+parser.add_argument("--capture", action="store_true", help="Enable transition capture mode")
+args = parser.parse_args()
+
+COLLECT_TRANSITIONS = args.capture
 USE_DINO_EMBEDDING = True
 DINO_DIM = 32
 DINO_UPDATE_EVERY = 8   # recompute embedding every 8 detected frames
