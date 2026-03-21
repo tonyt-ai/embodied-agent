@@ -847,8 +847,8 @@ export default function Home() {
 
     if (!frameCanvasRef.current) {
       const canvas = document.createElement("canvas");
-      canvas.width = 384;
-      canvas.height = 216;
+      canvas.width = 640;
+      canvas.height = 360;
       frameCanvasRef.current = canvas;
     }
 
@@ -872,7 +872,7 @@ export default function Home() {
 
       const t0 = performance.now();
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.3);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
       const t1 = performance.now();
 
       setCaptureMs(t1 - t0);

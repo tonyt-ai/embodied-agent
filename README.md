@@ -156,9 +156,9 @@ The agent’s internal decision is exposed through speech and avatar, making its
 
 ---
 
-# 🖥️ Demo UI
-
-![Demo UI](./public/demo-ui.png)
+# 🖥️ Demo
+Click on the image to see a video:
+[![Demo](./public/demo-ui.png)](./public/demo_video.mp4)
 
 Example of usage:
 * AI mode + Use Avatar Speech
@@ -335,6 +335,32 @@ After data collection, train the prediction model by running:
 ```bash
 python world_model/train_dynamics.py
 ```
+
+---
+# ⚡ Performance
+
+The system operates in real-time with low end-to-end latency.
+Below are typical profiling measurements on a laptop GPU:
+```bash
+Capture:           ~3 ms
+Server decode:     ~0.5 ms
+Server detect:     ~8–10 ms
+Server total:      ~9–12 ms
+Pipeline latency:  ~10–15 ms
+```
+### Breakdown
+
+* Capture: frame acquisition and encoding in the browser
+* Server decode: base64 → image reconstruction
+* Server detect: YOLO inference (dominant cost)
+* Server total: full backend processing (detection + state update)
+* Pipeline latency: end-to-end round-trip latency
+
+### Observations
+* The system runs at ~80–100 FPS equivalent latency
+* YOLO inference dominates compute (~80%)
+* DINO embeddings (when enabled sparsely) have negligible impact on latency
+* The architecture supports real-time closed-loop control
 
 ---
 
