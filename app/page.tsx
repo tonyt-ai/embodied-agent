@@ -760,25 +760,55 @@ export default function Home() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cams = devices.filter((d) => d.kind === "videoinput");
     setVideoDevices(cams);
-
-    if (!cams.length) return;
-
-    // If user already selected something, keep it
-    if (selectedCameraId && cams.some((c) => c.deviceId === selectedCameraId)) {
-      return;
+    
+    if (cams.length > 0 && !selectedCameraId) {
+      setSelectedCameraId(cams[0].deviceId);
     }
+  }
 
-    let preferred;
+  async function switchCamera(deviceId: string) {
+    try {
+      // Stop frame sending first.
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
 
-    if (cams.length === 1) {
-      // Only one camera → use it
-      preferred = cams[0].deviceId;
-    } else {
-      // Multiple cameras → assume external is last
-      preferred = cams[cams.length - 1].deviceId;
+      // Stop and release previous stream.
+      if (localCamStreamRef.current) {
+        localCamStreamRef.current.getTracks().forEach((t) => t.stop());
+        localCamStreamRef.current = null;
+      }
+
+      // Clear the video element.
+      if (localCamRef.current) {
+        localCamRef.current.pause();
+        localCamRef.current.srcObject = null;
+        localCamRef.current.load();
+      }
+
+      // Small delay helps flaky USB cameras on Windows.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      // Re-open with soft constraints first.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: deviceId },
+        },
+        audio: false,
+      });
+
+      localCamStreamRef.current = stream;
+
+      if (localCamRef.current) {
+        localCamRef.current.srcObject = stream;
+        await localCamRef.current.play();
+      }
+
+      startSendingFrames();
+    } catch (err) {
+      console.error("switchCamera failed:", err);
     }
-
-    setSelectedCameraId(preferred);
   }
 
   async function startLocalCamera() {
@@ -1234,7 +1264,11 @@ export default function Home() {
                   <label style={{ marginRight: 8 }}>Camera:</label>
                   <select
                     value={selectedCameraId || ""}
-                    onChange={(e) => setSelectedCameraId(e.target.value)}
+                    onChange={async (e) => {
+                      const id = e.target.value;
+                      setSelectedCameraId(id);
+                      await switchCamera(id);
+                    }}
                   >
                     {videoDevices.map((cam, i) => (
                       <option key={cam.deviceId} value={cam.deviceId}>
