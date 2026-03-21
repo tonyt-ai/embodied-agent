@@ -3,6 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, Track } from "livekit-client";
 
+// This file implements the main UI and orchestration for the Embodied Agent demo.
+// - LiveAvatar connection (video + audio playback from server)
+// - Gemini bridge for AI speech transcription + generation
+// - World model live loop for camera observation, object detection, and planning
+// - Local microphone capture and resampling for streaming to remote agent
+
+// Convert float32 audio samples into signed 16-bit PCM for downstream processing.
 function floatTo16BitPCM(float32Array: Float32Array) {
   const buffer = new ArrayBuffer(float32Array.length * 2);
   const view = new DataView(buffer);
@@ -16,6 +23,7 @@ function floatTo16BitPCM(float32Array: Float32Array) {
   return new Uint8Array(buffer);
 }
 
+// Encode raw binary bytes as a base64 string for WebSocket transport.
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
@@ -24,6 +32,7 @@ function bytesToBase64(bytes: Uint8Array) {
   return btoa(binary);
 }
 
+// Resample Float32 PCM from one sample rate to another (linear interpolation).
 function resampleFloat32(
   input: Float32Array,
   inputSampleRate: number,
@@ -50,6 +59,7 @@ function resampleFloat32(
   return result;
 }
 
+// Generate an event id for agent speech turns / interruptions.
 function randomEventId() {
   return crypto.randomUUID();
 }
@@ -58,6 +68,7 @@ type Mode = "ai" | "direct";
 
 type ButtonTone = "primary" | "secondary" | "danger";
 
+// UI helper: card container reboot style
 function cardStyle(): React.CSSProperties {
   return {
     background: "#ffffff",
@@ -91,6 +102,8 @@ function actionButtonStyle(
       borderColor: "#0f172a",
     };
   }
+
+  // Secondary and danger share a common base visual logic.
 
   if (tone === "danger") {
     return {
@@ -127,6 +140,8 @@ function statusDotColor(active: boolean) {
   return active ? "#16a34a" : "#94a3b8";
 }
 
+// Main React component for the app page. Manages refs, state, connections,
+// and UI rendering for the agent + world model + camera pipeline.
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -153,6 +168,7 @@ export default function Home() {
   const [inputTranscript, setInputTranscript] = useState("");
   const [outputTranscript, setOutputTranscript] = useState("");
   const [directAudioMonitor, setDirectAudioMonitor] = useState(false);
+  const [observedObjects, setObservedObjects] = useState<any[]>([]);
 
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
@@ -192,6 +208,7 @@ export default function Home() {
     setBestActionName("");
     setInputTranscript("");
     setOutputTranscript("");
+    setObservedObjects([]);
     setFrameAgeMs(null);
     setCaptureMs(null);
     setServerDecodeMs(null);
@@ -204,6 +221,7 @@ export default function Home() {
     window.speechSynthesis?.cancel();
   }
 
+  // Establish avatar session via backend API and prepare world model + speech pipeline.
   async function startAvatar() {
     try {
       setStatus("Creating LiveAvatar session...");
@@ -491,9 +509,9 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "state_updated") {
-          if (showDebug) {
-            setWorldStateText(JSON.stringify({ objects: msg.objects || [] }, null, 2));
-          }
+          const objects = msg.objects || [];
+          setObservedObjects(objects);
+          setWorldStateText(JSON.stringify({ objects }, null, 2));
 
           if (typeof msg.frame_timestamp === "number") {
             const age = Date.now() - msg.frame_timestamp;
@@ -743,9 +761,24 @@ export default function Home() {
     const cams = devices.filter((d) => d.kind === "videoinput");
     setVideoDevices(cams);
 
-    if (cams.length > 0 && !selectedCameraId) {
-      setSelectedCameraId(cams[0].deviceId);
+    if (!cams.length) return;
+
+    // If user already selected something, keep it
+    if (selectedCameraId && cams.some((c) => c.deviceId === selectedCameraId)) {
+      return;
     }
+
+    let preferred;
+
+    if (cams.length === 1) {
+      // Only one camera → use it
+      preferred = cams[0].deviceId;
+    } else {
+      // Multiple cameras → assume external is last
+      preferred = cams[cams.length - 1].deviceId;
+    }
+
+    setSelectedCameraId(preferred);
   }
 
   async function startLocalCamera() {
@@ -882,15 +915,9 @@ export default function Home() {
   }
 
   function getObservedCupPosition() {
-    try {
-      const parsed = JSON.parse(worldStateText || "{}");
-      const objects = parsed.objects || [];
-      const cup = objects.find((o: any) => o.label === "cup");
-      if (!cup) return null;
-      return { x: cup.x, y: cup.y };
-    } catch {
-      return null;
-    }
+    const cup = observedObjects.find((o: any) => o.label === "cup");
+    if (!cup) return null;
+    return { x: cup.x, y: cup.y };
   }
 
   function maybeSpeakWorldModelExplanation(text: string) {
