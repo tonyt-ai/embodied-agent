@@ -17,6 +17,7 @@ import math
 import numpy as np
 import os
 import time
+import torch
 import websockets
 
 from dino_encoder import encode_bbox
@@ -34,7 +35,9 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Load object detector (YOLO) from local model file
 YOLO_MODEL_PATH = os.path.join(MODEL_DIR, "yolov8n.pt")
+YOLO_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = YOLO(YOLO_MODEL_PATH)
+model = model.to(YOLO_DEVICE)
 
 # File to append collected transitions (JSON lines)
 TRANSITIONS_FILE = os.path.join(DATA_DIR, "transitions.jsonl")
@@ -93,7 +96,7 @@ def detect_best_cup(frame):
     """
     global last_dino_embedding, dino_frame_counter
 
-    results = model(frame, verbose=False)
+    results = model(frame, verbose=False, device=YOLO_DEVICE)
     h, w = frame.shape[:2]
 
     best = None
@@ -328,6 +331,7 @@ async def main():
         print("World model server running on ws://localhost:8090")
         print(f"Automatic transition collection: {'ON' if COLLECT_TRANSITIONS else 'OFF'}")
         print(f"Transitions file: {Path(TRANSITIONS_FILE).resolve()}")
+        print(f"YOLO device: {YOLO_DEVICE}")
         print(f"DINO embeddings: {'ON' if USE_DINO_EMBEDDING else 'OFF'}")
         try:
             await asyncio.Future()
