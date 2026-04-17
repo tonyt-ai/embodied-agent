@@ -20,7 +20,10 @@ import time
 import torch
 import websockets
 
+from camera_tracker import CameraTracker
+from depth import estimate_depth, summarize_depth
 from dino_encoder import encode_bbox
+from lift_to_3d import infer_camera_intrinsics, lift_bbox_to_3d
 from pathlib import Path
 from planner import simulate_all_actions
 from ultralytics import YOLO
@@ -60,6 +63,7 @@ dino_frame_counter = 0
 prev_state_vec = None
 prev_move_vec = None
 state = WorldState(collection_mode=COLLECT_TRANSITIONS)
+camera_tracker = CameraTracker()
 
 
 def save_transition(state_vec, action_vec, next_state_vec):
@@ -112,14 +116,12 @@ def detect_best_cup(frame):
             if label != "cup":
                 continue
             if conf < 0.10:
-                # very low confidence — ignore
                 continue
 
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             bw = (x2 - x1) / w
             bh = (y2 - y1) / h
             if bw < 0.02 or bh < 0.02:
-                # ignore tiny detections
                 continue
 
             if conf > best_conf:
@@ -141,14 +143,12 @@ def detect_best_cup(frame):
 
     emb = last_dino_embedding
     if USE_DINO_EMBEDDING:
-        # Update the DINO embedding only occasionally for performance
         dino_frame_counter += 1
         if dino_frame_counter % DINO_UPDATE_EVERY == 0:
             try:
                 emb = encode_bbox(frame, bbox_norm, out_dim=DINO_DIM)
                 last_dino_embedding = emb
             except Exception as e:
-                # Keep last embedding on failure
                 print(f"DINO encode warning: {e}")
                 emb = last_dino_embedding
 
@@ -162,6 +162,29 @@ def detect_best_cup(frame):
     }]
 
 
+def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
+    """Attach approximate 3D position fields to 2D detections."""
+    enriched = []
+    for det in detections:
+        bbox = det.get("bbox")
+        if not bbox:
+            enriched.append(det)
+            continue
+
+        lifted = lift_bbox_to_3d(bbox, depth_map, camera_pose, intrinsics)
+        item = det.copy()
+        item["position_camera_3d"] = lifted["position_camera_3d"]
+        item["position_3d"] = lifted["position_world_3d"]
+        item["velocity_3d"] = [0.0, 0.0, 0.0]
+        item["depth"] = lifted["depth"]
+        item["depth_confidence"] = lifted["depth_confidence"]
+        item["pixel_center"] = lifted["pixel_center"]
+        item["bbox_area_ratio"] = lifted["bbox_area_ratio"]
+        enriched.append(item)
+
+    return enriched
+
+
 def is_effectively_empty(state_vec):
     """True when a state vector is missing or has negligible position.
 
@@ -172,16 +195,10 @@ def is_effectively_empty(state_vec):
 
 
 def maybe_collect_transition(curr_state_vec):
-    """Conditionally save a transition (previous_state, action, next_state).
-
-    Uses simple heuristics on motion magnitude and continuity to decide
-    whether a movement should be recorded. Returns True when a transition
-    was saved.
-    """
+    """Conditionally save a transition (previous_state, action, next_state)."""
     global prev_state_vec, prev_move_vec
 
     if not COLLECT_TRANSITIONS:
-        # If collection disabled, just update the previous state cache
         prev_state_vec = curr_state_vec
         prev_move_vec = None
         return False
@@ -202,7 +219,6 @@ def maybe_collect_transition(curr_state_vec):
     dy = curr_y - prev_y
     move = math.sqrt(dx * dx + dy * dy)
 
-    # Heuristic thresholds for recording transitions
     MIN_MOVE = 0.012
     MAX_MOVE = 0.25
 
@@ -210,12 +226,10 @@ def maybe_collect_transition(curr_state_vec):
         return False
 
     if move > MAX_MOVE:
-        # Too large — likely a detection jump; reset tracking
         prev_state_vec = curr_state_vec
         prev_move_vec = None
         return False
 
-    # Reject abrupt direction changes compared to previous motion
     if prev_move_vec is not None:
         prev_dx, prev_dy = prev_move_vec
         ddx = abs(prev_dx - dx)
@@ -225,11 +239,9 @@ def maybe_collect_transition(curr_state_vec):
             prev_move_vec = None
             return False
 
-    # Normalize action to a unit-like vector (preserve direction only)
     norm = move + 1e-6
     action_vec = [dx / norm, dy / norm]
 
-    # Prepare next_state with velocity fields populated
     next_state_vec = curr_state_vec.copy()
     next_state_vec[2] = dx
     next_state_vec[3] = dy
@@ -247,11 +259,7 @@ def maybe_collect_transition(curr_state_vec):
 
 
 def answer_query(query):
-    """Handle simple queries coming from websocket clients.
-
-    Known query types:
-    - `simulate_actions`: runs `simulate_all_actions` using the current state
-    """
+    """Handle simple queries coming from websocket clients."""
     qtype = query.get("query")
 
     if qtype == "simulate_actions":
@@ -268,13 +276,7 @@ def answer_query(query):
 
 
 async def handler(websocket):
-    """Main websocket handler: process incoming frames and queries.
-
-    Expects messages with `type` either `frame` (containing `image`)
-    or `query`. For frames it decodes, runs detection, updates the
-    `WorldState`, optionally records transitions, and responds with
-    timing and state information.
-    """
+    """Main websocket handler: process incoming frames and queries."""
     async for message in websocket:
         data = json.loads(message)
 
@@ -283,20 +285,43 @@ async def handler(websocket):
             frame = decode_data_url_image(data["image"])
             t1 = time.perf_counter()
 
-            # Run expensive detection on a thread to avoid blocking the loop
             objects = await asyncio.to_thread(detect_best_cup, frame)
             t2 = time.perf_counter()
 
-            # Update in-memory world state and possibly save a transition
-            state.update(objects)
+            depth_map = estimate_depth(frame)
+            camera_pose = camera_tracker.update(frame)
+            intrinsics = infer_camera_intrinsics(frame.shape[1], frame.shape[0])
+            objects = enrich_detections_with_3d(objects, depth_map, camera_pose, intrinsics)
+            world_debug = {
+                **summarize_depth(depth_map),
+                "intrinsics": {
+                    "fx": round(float(intrinsics["fx"]), 2),
+                    "fy": round(float(intrinsics["fy"]), 2),
+                    "cx": round(float(intrinsics["cx"]), 2),
+                    "cy": round(float(intrinsics["cy"]), 2),
+                },
+                "num_objects": len(objects),
+            }
+
+            state.update(
+                objects,
+                camera_pose=camera_pose,
+                hands=[],
+                world_debug=world_debug,
+            )
             curr_state_vec = state.get_state_vector()
             saved = maybe_collect_transition(curr_state_vec)
             t3 = time.perf_counter()
 
             try:
+                world_state_export = state.export_world_state()
                 await websocket.send(json.dumps({
                     "type": "state_updated",
                     "objects": state.export_objects(),
+                    "objects_3d": world_state_export["objects_3d"],
+                    "camera_pose": world_state_export["camera_pose"],
+                    "hands": world_state_export["hands"],
+                    "world_debug": world_state_export["world_debug"],
                     "frame_timestamp": data.get("timestamp"),
                     "capture_ms": data.get("capture_ms"),
                     "server_decode_ms": (t1 - t0) * 1000.0,
@@ -318,7 +343,6 @@ async def handler(websocket):
 
 
 async def main():
-    # Start websocket server on localhost:8090 with reasonable timeouts
     async with websockets.serve(
         handler,
         "localhost",

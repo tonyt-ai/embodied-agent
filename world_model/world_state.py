@@ -55,6 +55,11 @@ class WorldState:
         self.move_threshold = 0.03
         self.smoothing_alpha = 0.0 if collection_mode else 0.20
 
+        self.camera_pose = None
+        self.objects_3d = []
+        self.hands = []
+        self.world_debug = {}
+
     def set_collection_mode(self, enabled: bool):
         """Toggle collection mode which affects smoothing and timeouts."""
         self.collection_mode = enabled
@@ -96,7 +101,7 @@ class WorldState:
 
         return best_id
 
-    def update(self, detections):
+    def update(self, detections, camera_pose=None, hands=None, world_debug=None):
         """Update tracker with a list of detection dicts.
 
         - New detections get a fresh id and an 'appeared' event.
@@ -108,6 +113,9 @@ class WorldState:
         """
         now = time.time()
         updated_ids = set()
+        self.camera_pose = camera_pose or self.camera_pose
+        self.hands = hands or []
+        self.world_debug = world_debug or {}
 
         for det in detections:
             matched_id = self._match_existing(det)
@@ -125,6 +133,11 @@ class WorldState:
                 det["vy"] = 0.0
                 det["missing_since"] = None
                 det["embedding"] = det.get("embedding", [0.0] * DINO_STATE_DIM)
+                det["position_3d"] = det.get("position_3d", [0.0, 0.0, 0.0])
+                det["position_camera_3d"] = det.get("position_camera_3d", det["position_3d"])
+                det["velocity_3d"] = det.get("velocity_3d", [0.0, 0.0, 0.0])
+                det["depth"] = det.get("depth", 0.0)
+                det["depth_confidence"] = det.get("depth_confidence", 0.0)
 
                 self.objects[matched_id] = det
                 self.last_changes.append({
@@ -160,6 +173,23 @@ class WorldState:
                 det["vx"] = round(dx, 3)
                 det["vy"] = round(dy, 3)
                 det["embedding"] = det.get("embedding", prev.get("embedding", [0.0] * DINO_STATE_DIM))
+
+                prev_pos_3d = prev.get("position_3d", [0.0, 0.0, 0.0])
+                curr_pos_3d = det.get("position_3d", prev_pos_3d)
+                det["position_3d"] = curr_pos_3d
+                det["position_camera_3d"] = det.get(
+                    "position_camera_3d",
+                    prev.get("position_camera_3d", curr_pos_3d),
+                )
+                det["velocity_3d"] = [
+                    round(curr_pos_3d[i] - prev_pos_3d[i], 4)
+                    for i in range(3)
+                ]
+                det["depth"] = det.get("depth", prev.get("depth", 0.0))
+                det["depth_confidence"] = det.get(
+                    "depth_confidence",
+                    prev.get("depth_confidence", 0.0),
+                )
 
                 moved = math.sqrt(dx * dx + dy * dy)
                 if moved > self.move_threshold:
@@ -202,11 +232,25 @@ class WorldState:
         # Append a compact snapshot for debugging/visualization and keep history small
         snapshot = {
             "time": now,
-            "objects": [obj.copy() for obj in self.objects.values()]
+            "objects": [obj.copy() for obj in self.objects.values()],
+            "camera_pose": self.camera_pose,
+            "hands": self.hands,
         }
         self.history.append(snapshot)
         self.history = self.history[-30:]
         self.last_changes = self.last_changes[-20:]
+        self.objects_3d = [
+            {
+                "id": obj["id"],
+                "label": obj["label"],
+                "position_3d": obj.get("position_3d", [0.0, 0.0, 0.0]),
+                "position_camera_3d": obj.get("position_camera_3d", [0.0, 0.0, 0.0]),
+                "velocity_3d": obj.get("velocity_3d", [0.0, 0.0, 0.0]),
+                "depth": obj.get("depth", 0.0),
+                "depth_confidence": obj.get("depth_confidence", 0.0),
+            }
+            for obj in self.export_objects()
+        ]
 
     def find_by_label(self, label):
         """Return currently visible objects with given label sorted by recency.
@@ -276,3 +320,16 @@ class WorldState:
             reverse=True,
         )
         return objects
+
+    def export_objects_3d(self):
+        """Return current visible objects with only 3D-centric fields."""
+        return self.objects_3d
+
+    def export_world_state(self):
+        """Return a compact world-state payload for websocket clients."""
+        return {
+            "camera_pose": self.camera_pose,
+            "objects_3d": self.export_objects_3d(),
+            "hands": self.hands,
+            "world_debug": self.world_debug,
+        }

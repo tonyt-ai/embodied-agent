@@ -185,6 +185,10 @@ export default function Home() {
   const [plannerSummary, setPlannerSummary] = useState("");
   const [plannerSimulations, setPlannerSimulations] = useState<any | null>(null);
   const [bestActionName, setBestActionName] = useState("");
+  const [cameraPoseText, setCameraPoseText] = useState("");
+  const [objects3dText, setObjects3dText] = useState("");
+  const [handsText, setHandsText] = useState("");
+  const [worldDebugText, setWorldDebugText] = useState("");
 
   const [autoMode, setAutoMode] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
@@ -206,6 +210,10 @@ export default function Home() {
     setPlannerSummary("");
     setPlannerSimulations(null);
     setBestActionName("");
+    setCameraPoseText("");
+    setObjects3dText("");
+    setHandsText("");
+    setWorldDebugText("");
     setInputTranscript("");
     setOutputTranscript("");
     setObservedObjects([]);
@@ -510,8 +518,16 @@ export default function Home() {
 
         if (msg.type === "state_updated") {
           const objects = msg.objects || [];
+          const cameraPose = msg.camera_pose || null;
+          const objects3d = msg.objects_3d || [];
+          const hands = msg.hands || [];
+          const worldDebug = msg.world_debug || {};
           setObservedObjects(objects);
           setWorldStateText(JSON.stringify({ objects }, null, 2));
+          setCameraPoseText(JSON.stringify(cameraPose, null, 2));
+          setObjects3dText(JSON.stringify(objects3d, null, 2));
+          setHandsText(JSON.stringify(hands, null, 2));
+          setWorldDebugText(JSON.stringify(worldDebug, null, 2));
 
           if (typeof msg.frame_timestamp === "number") {
             const age = Date.now() - msg.frame_timestamp;
@@ -1626,7 +1642,97 @@ export default function Home() {
             </div>
           </section>
         )}
+
+        {showDebug && (
+          <section
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+              gap: 16,
+            }}
+          >
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>3D object state</h2>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontSize: 12,
+                  height: 200,
+                  overflowY: "auto",
+                  background: "#f8fafc",
+                  padding: 14,
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  margin: 0,
+                }}
+              >
+                {objects3dText || "(No 3D objects yet)"}
+              </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>Camera pose</h2>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontSize: 12,
+                  height: 200,
+                  overflowY: "auto",
+                  background: "#f8fafc",
+                  padding: 14,
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  margin: 0,
+                }}
+              >
+                {cameraPoseText || "(No pose yet)"}
+              </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>World debug</h2>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontSize: 12,
+                  height: 200,
+                  overflowY: "auto",
+                  background: "#f8fafc",
+                  padding: 14,
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  margin: 0,
+                }}
+              >
+                {worldDebugText || "(No world debug yet)"}
+              </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>Hands</h2>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontSize: 12,
+                  height: 200,
+                  overflowY: "auto",
+                  background: "#f8fafc",
+                  padding: 14,
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  margin: 0,
+                }}
+              >
+                {handsText || "(No hands yet)"}
+              </pre>
+            </div>
+          </section>
+        )}
       </div>
     </main>
   );
 }
+
+
+
+
