@@ -189,6 +189,7 @@ export default function Home() {
   const [objects3dText, setObjects3dText] = useState("");
   const [handsText, setHandsText] = useState("");
   const [worldDebugText, setWorldDebugText] = useState("");
+  const [depthDebugUrl, setDepthDebugUrl] = useState("");
 
   const [autoMode, setAutoMode] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
@@ -214,6 +215,7 @@ export default function Home() {
     setObjects3dText("");
     setHandsText("");
     setWorldDebugText("");
+    setDepthDebugUrl("");
     setInputTranscript("");
     setOutputTranscript("");
     setObservedObjects([]);
@@ -522,12 +524,14 @@ export default function Home() {
           const objects3d = msg.objects_3d || [];
           const hands = msg.hands || [];
           const worldDebug = msg.world_debug || {};
+          const depthDebug = msg.depth_debug || null;
           setObservedObjects(objects);
           setWorldStateText(JSON.stringify({ objects }, null, 2));
           setCameraPoseText(JSON.stringify(cameraPose, null, 2));
           setObjects3dText(JSON.stringify(objects3d, null, 2));
           setHandsText(JSON.stringify(hands, null, 2));
           setWorldDebugText(JSON.stringify(worldDebug, null, 2));
+          setDepthDebugUrl(depthDebug?.image ? `data:${depthDebug.mime_type};base64,${depthDebug.image}` : "");
 
           if (typeof msg.frame_timestamp === "number") {
             const age = Date.now() - msg.frame_timestamp;
@@ -1709,6 +1713,32 @@ export default function Home() {
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>Depth map</h2>
+              <div
+                style={{
+                  height: 200,
+                  overflow: "hidden",
+                  background: "#020617",
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {depthDebugUrl ? (
+                  <img
+                    src={depthDebugUrl}
+                    alt="Depth debug"
+                    style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                  />
+                ) : (
+                  <span style={{ color: "#cbd5e1", fontSize: 12 }}>(No depth map yet)</span>
+                )}
+              </div>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
               <h2 style={{ marginTop: 0, fontSize: 18 }}>Hands</h2>
               <pre
                 style={{
@@ -1732,6 +1762,7 @@ export default function Home() {
     </main>
   );
 }
+
 
 
 

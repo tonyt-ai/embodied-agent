@@ -183,6 +183,25 @@ def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
         enriched.append(item)
 
     return enriched
+def encode_depth_debug(depth_map, width=160, height=90):
+    """Encode a small false-color preview of the depth map for the UI."""
+    if depth_map is None or depth_map.size == 0:
+        return None
+
+    preview = cv2.resize(depth_map, (width, height), interpolation=cv2.INTER_AREA)
+    normalized = cv2.normalize(preview, None, 0, 255, cv2.NORM_MINMAX)
+    normalized = normalized.astype(np.uint8)
+    heatmap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+    ok, encoded = cv2.imencode(".jpg", heatmap, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    if not ok:
+        return None
+
+    return {
+        "width": width,
+        "height": height,
+        "mime_type": "image/jpeg",
+        "image": base64.b64encode(encoded.tobytes()).decode("ascii"),
+    }
 
 
 def is_effectively_empty(state_vec):
@@ -292,6 +311,7 @@ async def handler(websocket):
             camera_pose = camera_tracker.update(frame)
             intrinsics = infer_camera_intrinsics(frame.shape[1], frame.shape[0])
             objects = enrich_detections_with_3d(objects, depth_map, camera_pose, intrinsics)
+            depth_debug = encode_depth_debug(depth_map)
             world_debug = {
                 **summarize_depth(depth_map),
                 "intrinsics": {
@@ -322,6 +342,7 @@ async def handler(websocket):
                     "camera_pose": world_state_export["camera_pose"],
                     "hands": world_state_export["hands"],
                     "world_debug": world_state_export["world_debug"],
+                    "depth_debug": depth_debug,
                     "frame_timestamp": data.get("timestamp"),
                     "capture_ms": data.get("capture_ms"),
                     "server_decode_ms": (t1 - t0) * 1000.0,
@@ -368,3 +389,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nWorld model server stopped.")
+
