@@ -64,7 +64,8 @@ function randomEventId() {
   return crypto.randomUUID();
 }
 
-type Mode = "ai" | "direct";
+type CaptureMode = "social" | "embodied";
+type AvatarMode = "ai" | "direct";
 
 type ButtonTone = "primary" | "secondary" | "danger";
 
@@ -159,7 +160,8 @@ export default function Home() {
   const currentAvatarEventIdRef = useRef<string | null>(null);
   const avatarTurnStartedRef = useRef(false);
 
-  const [mode, setMode] = useState<Mode>("ai");
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("embodied");
+  const [avatarMode, setAvatarMode] = useState<AvatarMode>("ai");
   const [status, setStatus] = useState("idle");
   const [avatarConnected, setAvatarConnected] = useState(false);
   const [bridgeConnected, setBridgeConnected] = useState(false);
@@ -203,6 +205,39 @@ export default function Home() {
   const [serverDetectMs, setServerDetectMs] = useState<number | null>(null);
   const [serverTotalMs, setServerTotalMs] = useState<number | null>(null);
   const [pipelineAgeMs, setPipelineAgeMs] = useState<number | null>(null);
+
+  const isEmbodiedMode = captureMode === "embodied";
+  const isSocialMode = captureMode === "social";
+
+  const socialState = {
+    inputTranscript,
+    outputTranscript,
+    directAudioMonitor,
+    useAvatarSpeech,
+    isSpeaking,
+  };
+
+  const embodiedState = {
+    observedObjects,
+    worldStateText,
+    eventLog,
+    lastQueryResultText,
+    plannerSummary,
+    plannerSimulations,
+    bestActionName,
+    cameraPoseText,
+    objects3dText,
+    handsText,
+    worldDebugText,
+    depthDebugUrl,
+    autoMode,
+    frameAgeMs,
+    captureMs,
+    serverDecodeMs,
+    serverDetectMs,
+    serverTotalMs,
+    pipelineAgeMs,
+  };
 
   function resetWorldUiState() {
     setWorldStateText("");
@@ -277,7 +312,7 @@ export default function Home() {
           }
 
           const shouldPlayAudio =
-            mode === "ai" || (mode === "direct" && directAudioMonitor);
+            avatarMode === "ai" || (avatarMode === "direct" && directAudioMonitor);
 
           if (shouldPlayAudio) {
             const audioEl = track.attach();
@@ -303,20 +338,28 @@ export default function Home() {
         setAvatarConnected(true);
 
         try {
-          connectWorldModel();
-          await startLocalCamera();
-          startSendingFrames();
+          if (isEmbodiedMode) {
+            connectWorldModel();
+            await startLocalCamera();
+            startSendingFrames();
+          } else {
+            await startLocalCamera();
+          }
         } catch (err) {
-          console.error("World model camera startup failed:", err);
+          console.error("Camera/world-model startup failed:", err);
         }
 
-        if (mode === "ai" || useAvatarSpeech) {
+        if (avatarMode === "ai" || useAvatarSpeech) {
           connectGeminiBridge();
         } else {
           setBridgeConnected(false);
         }
 
-        setStatus(mode === "ai" ? "Avatar ready (AI mode)" : "Avatar ready (Direct mode)");
+        setStatus(
+          isEmbodiedMode
+            ? (avatarMode === "ai" ? "Avatar ready (Embodied AI)" : "Avatar ready (Embodied Direct)")
+            : (avatarMode === "ai" ? "Avatar ready (Social AI)" : "Avatar ready (Social Direct)")
+        );
       };
 
       avatarWs.onmessage = (event) => {
@@ -331,7 +374,7 @@ export default function Home() {
             setIsSpeaking(false);
             avatarTurnStartedRef.current = false;
             currentAvatarEventIdRef.current = null;
-            setStatus(mode === "ai" ? "Avatar finished speaking" : "Avatar finished direct speech");
+            setStatus(avatarMode === "ai" ? "Avatar finished speaking" : "Avatar finished direct speech");
           }
 
           if (msg.type === "agent.speak_interrupted") {
@@ -359,6 +402,11 @@ export default function Home() {
   }
 
   async function startWorldModelOnly() {
+    if (!isEmbodiedMode) {
+      setStatus("World model only is available in Embodied mode");
+      return;
+    }
+
     try {
       setStatus("Starting world model only...");
       resetWorldUiState();
@@ -414,13 +462,13 @@ export default function Home() {
           "stop guiding me",
         ];
 
-        if (startGuidancePhrases.some((p) => normalized.includes(p))) {
+        if (isEmbodiedMode && startGuidancePhrases.some((p) => normalized.includes(p))) {
           setAutoMode(true);
           setStatus("Auto guidance enabled by voice");
           return;
         }
 
-        if (stopGuidancePhrases.some((p) => normalized.includes(p))) {
+        if (isEmbodiedMode && stopGuidancePhrases.some((p) => normalized.includes(p))) {
           setAutoMode(false);
           setStatus("Auto guidance disabled by voice");
           return;
@@ -632,7 +680,7 @@ export default function Home() {
 
   async function startMic() {
     try {
-      if (mode === "ai") {
+      if (avatarMode === "ai") {
         if (!geminiBridgeRef.current || geminiBridgeRef.current.readyState !== WebSocket.OPEN) {
           alert("Gemini bridge is not connected yet.");
           return;
@@ -655,7 +703,7 @@ export default function Home() {
 
       mediaStreamRef.current = stream;
 
-      const targetSampleRate = mode === "ai" ? 16000 : 24000;
+      const targetSampleRate = avatarMode === "ai" ? 16000 : 24000;
       const audioContext = new AudioContext({ sampleRate: targetSampleRate });
       audioContextRef.current = audioContext;
 
@@ -676,7 +724,7 @@ export default function Home() {
         const floatChunk = new Float32Array(event.data);
         const sourceRate = audioContextRef.current?.sampleRate ?? 16000;
 
-        if (mode === "ai") {
+        if (avatarMode === "ai") {
           const resampled = resampleFloat32(floatChunk, sourceRate, 16000);
           const pcm16 = floatTo16BitPCM(resampled);
           const base64 = bytesToBase64(pcm16);
@@ -729,7 +777,7 @@ export default function Home() {
       silentGain.connect(audioContext.destination);
 
       setMicOn(true);
-      setStatus(mode === "ai" ? "Mic on (AI mode)" : "Mic on (Direct mode)");
+      setStatus(avatarMode === "ai" ? "Mic on (AI mode)" : "Mic on (Direct mode)");
     } catch (error) {
       console.error("startMic error:", error);
       setStatus(error instanceof Error ? error.message : "Mic error");
@@ -752,7 +800,7 @@ export default function Home() {
     audioContextRef.current?.close();
     audioContextRef.current = null;
 
-    if (mode === "ai") {
+    if (avatarMode === "ai") {
       geminiBridgeRef.current?.send(JSON.stringify({ type: "end_audio" }));
     } else {
       if (
@@ -773,7 +821,7 @@ export default function Home() {
     }
 
     setMicOn(false);
-    setStatus(mode === "ai" ? "Mic off (AI mode)" : "Mic off (Direct mode)");
+    setStatus(avatarMode === "ai" ? "Mic off (AI mode)" : "Mic off (Direct mode)");
   }
 
   async function loadVideoDevices() {
@@ -996,7 +1044,7 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (!autoMode) return;
+    if (!isEmbodiedMode || !autoMode) return;
 
     const interval = setInterval(() => {
       if (!worldModelWsRef.current || worldModelWsRef.current.readyState !== WebSocket.OPEN) {
@@ -1010,7 +1058,7 @@ export default function Home() {
     }, 1200);
 
     return () => clearInterval(interval);
-  }, [autoMode]);
+  }, [autoMode, isEmbodiedMode]);
 
   useEffect(() => {
     if (!useAvatarSpeech) return;
@@ -1039,11 +1087,13 @@ export default function Home() {
     };
   }, []);
 
-  const modeLocked = avatarConnected || micOn;
+  const avatarModeLocked = avatarConnected || micOn;
+  const captureModeLocked = avatarConnected || micOn || !!worldModelWsRef.current;
 
   const statusItems = [
     { label: "Status", value: status, active: status !== "idle" },
-    { label: "Mode", value: mode === "ai" ? "AI mode" : "Direct mode", active: true },
+    { label: "Capture", value: isEmbodiedMode ? "embodied" : "social", active: true },
+    { label: "Avatar", value: avatarMode === "ai" ? "AI mode" : "Direct mode", active: true },
     { label: "Avatar", value: avatarConnected ? "connected" : "disconnected", active: avatarConnected },
     { label: "Gemini bridge", value: bridgeConnected ? "connected" : "disconnected", active: bridgeConnected },
     { label: "Mic", value: micOn ? "on" : "off", active: micOn },
@@ -1169,27 +1219,54 @@ export default function Home() {
             <div style={{ marginBottom: 16 }}>
               <h2 style={{ margin: 0, fontSize: 20 }}>Controls</h2>
               <p style={{ margin: "6px 0 0 0", color: "#475569", fontSize: 14 }}>
-                Start the avatar, connect the world model, and trigger planning.
+                Choose a capture pipeline, then start the avatar and the relevant perception loop.
               </p>
             </div>
 
             <div style={{ display: "grid", gap: 14 }}>
               <div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: "#64748b", marginBottom: 8 }}>
-                  Mode
+                  Capture mode
                 </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
                   <button
-                    onClick={() => setMode("ai")}
-                    disabled={modeLocked || mode === "ai"}
-                    style={toggleChipStyle(mode === "ai", modeLocked || mode === "ai")}
+                    onClick={() => setCaptureMode("social")}
+                    disabled={captureModeLocked || isSocialMode}
+                    style={toggleChipStyle(isSocialMode, captureModeLocked || isSocialMode)}
+                  >
+                    Social mode
+                  </button>
+                  <button
+                    onClick={() => setCaptureMode("embodied")}
+                    disabled={captureModeLocked || isEmbodiedMode}
+                    style={toggleChipStyle(isEmbodiedMode, captureModeLocked || isEmbodiedMode)}
+                  >
+                    Embodied mode
+                  </button>
+                </div>
+                <p style={{ margin: "8px 0 0 0", color: "#64748b", fontSize: 13 }}>
+                  {isEmbodiedMode
+                    ? "Egocentric capture for world modeling, 3D state, and task guidance."
+                    : "Static webcam mode."}
+                </p>
+              </div>
+
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#64748b", marginBottom: 8 }}>
+                  Avatar mode
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  <button
+                    onClick={() => setAvatarMode("ai")}
+                    disabled={avatarModeLocked || avatarMode === "ai"}
+                    style={toggleChipStyle(avatarMode === "ai", avatarModeLocked || avatarMode === "ai")}
                   >
                     AI mode
                   </button>
                   <button
-                    onClick={() => setMode("direct")}
-                    disabled={modeLocked || mode === "direct"}
-                    style={toggleChipStyle(mode === "direct", modeLocked || mode === "direct")}
+                    onClick={() => setAvatarMode("direct")}
+                    disabled={avatarModeLocked || avatarMode === "direct"}
+                    style={toggleChipStyle(avatarMode === "direct", avatarModeLocked || avatarMode === "direct")}
                   >
                     Direct avatar mode
                   </button>
@@ -1206,7 +1283,7 @@ export default function Home() {
                       label: "Echo on",
                       checked: directAudioMonitor,
                       onChange: (checked: boolean) => setDirectAudioMonitor(checked),
-                      disabled: modeLocked && mode !== "direct",
+                      disabled: avatarModeLocked && avatarMode !== "direct",
                     },
                     {
                       label: "Use Avatar Speech",
@@ -1254,34 +1331,40 @@ export default function Home() {
                   <button onClick={startAvatar} style={actionButtonStyle("primary")}>
                     Start avatar
                   </button>
-                  <button onClick={startWorldModelOnly} style={actionButtonStyle("secondary")}>
-                    World model only
-                  </button>
+                  {isEmbodiedMode ? (
+                    <button onClick={startWorldModelOnly} style={actionButtonStyle("secondary")}>
+                      World model only
+                    </button>
+                  ) : null}
                   <button onClick={stopAllConnections} style={actionButtonStyle("danger")}>
                     Stop all
                   </button>
                   <button
                     onClick={startMic}
-                    disabled={!avatarConnected || micOn || (mode === "ai" && !bridgeConnected)}
-                    style={actionButtonStyle("secondary", !avatarConnected || micOn || (mode === "ai" && !bridgeConnected))}
+                    disabled={!avatarConnected || micOn || (avatarMode === "ai" && !bridgeConnected)}
+                    style={actionButtonStyle("secondary", !avatarConnected || micOn || (avatarMode === "ai" && !bridgeConnected))}
                   >
                     Start mic
                   </button>
                   <button onClick={stopMic} disabled={!micOn} style={actionButtonStyle("secondary", !micOn)}>
                     Stop mic
                   </button>
-                  <button
-                    onClick={() => setAutoMode((v) => !v)}
-                    style={actionButtonStyle(autoMode ? "primary" : "secondary")}
-                  >
-                    {autoMode ? "Stop guidance" : "Start guidance"}
-                  </button>
-                  <button onClick={askSimulateActions} style={actionButtonStyle("secondary")}>
-                    Simulate futures
-                  </button>
+                  {isEmbodiedMode ? (
+                    <button
+                      onClick={() => setAutoMode((v) => !v)}
+                      style={actionButtonStyle(autoMode ? "primary" : "secondary")}
+                    >
+                      {autoMode ? "Stop guidance" : "Start guidance"}
+                    </button>
+                  ) : null}
+                  {isEmbodiedMode ? (
+                    <button onClick={askSimulateActions} style={actionButtonStyle("secondary")}>
+                      Simulate futures
+                    </button>
+                  ) : null}
                 </div>
                 <div style={{ marginBottom: 12 }}>
-                  <label style={{ marginRight: 8 }}>Camera:</label>
+                  <label style={{ marginRight: 8 }}>{isEmbodiedMode ? "Egocentric camera:" : "Social webcam:"}</label>
                   <select
                     value={selectedCameraId || ""}
                     onChange={async (e) => {
@@ -1351,23 +1434,23 @@ export default function Home() {
           <div style={{ ...cardStyle(), padding: 16 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <div>
-                <h2 style={{ margin: 0, fontSize: 18 }}>Camera + planning overlay</h2>
+                <h2 style={{ margin: 0, fontSize: 18 }}>{isEmbodiedMode ? "Camera + planning overlay" : "Webcam preview"}</h2>
                 <p style={{ margin: "6px 0 0 0", color: "#64748b", fontSize: 14 }}>
-                  Local camera, goal marker, observed object, and simulated futures.
+{isEmbodiedMode ? "Local camera, goal marker, observed object, and simulated futures." : "Static webcam feed."}
                 </p>
               </div>
               <span
                 style={{
                   padding: "6px 10px",
                   borderRadius: 999,
-                  background: autoMode ? "#eff6ff" : "#f8fafc",
-                  color: autoMode ? "#1d4ed8" : "#475569",
-                  border: `1px solid ${autoMode ? "#bfdbfe" : "#e2e8f0"}`,
+                  background: isEmbodiedMode ? (autoMode ? "#eff6ff" : "#f8fafc") : "#fff7ed",
+                  color: isEmbodiedMode ? (autoMode ? "#1d4ed8" : "#475569") : "#9a3412",
+                  border: `1px solid ${isEmbodiedMode ? (autoMode ? "#bfdbfe" : "#e2e8f0") : "#fed7aa"}`,
                   fontWeight: 700,
                   fontSize: 12,
                 }}
               >
-                {autoMode ? "GUIDANCE ON" : "GUIDANCE OFF"}
+                {isEmbodiedMode ? (autoMode ? "GUIDANCE ON" : "GUIDANCE OFF") : "SOCIAL PREVIEW"}
               </span>
             </div>
 
@@ -1396,6 +1479,7 @@ export default function Home() {
                 }}
               />
 
+              {isEmbodiedMode ? (
               <div
                 style={{
                   position: "absolute",
@@ -1412,8 +1496,9 @@ export default function Home() {
                 }}
                 title="Goal"
               />
+              ) : null}
 
-              {(() => {
+              {isEmbodiedMode ? (() => {
                 const cup = getObservedCupPosition();
                 if (!cup) return null;
 
@@ -1435,10 +1520,10 @@ export default function Home() {
                     title="Current cup position"
                   />
                 );
-              })()}
+              })() : null}
 
-              {plannerSimulations &&
-                Object.entries(plannerSimulations).map(([sequenceKey, sim]: any) => {
+              {isEmbodiedMode && embodiedState.plannerSimulations &&
+                Object.entries(embodiedState.plannerSimulations).map(([sequenceKey, sim]: any) => {
                   const step1 = sim?.step1_state || [];
                   const step2 = sim?.predicted_state || [];
                   const sequence = sim?.sequence || [];
@@ -1459,7 +1544,7 @@ export default function Home() {
                   ) return null;
 
                   const firstAction = sequence[0];
-                  const isBest = firstAction === bestActionName;
+                  const isBest = firstAction === embodiedState.bestActionName;
 
                   let color = "#ffffff";
                   if (firstAction === "left") color = "#60a5fa";
@@ -1502,7 +1587,7 @@ export default function Home() {
                 Current best action and rollout summary.
               </p>
             </div>
-            {bestActionName ? (
+            {isEmbodiedMode && embodiedState.bestActionName ? (
               <span
                 style={{
                   padding: "7px 12px",
@@ -1515,7 +1600,7 @@ export default function Home() {
                   textTransform: "uppercase",
                 }}
               >
-                Best action: {bestActionName}
+                Best action: {embodiedState.bestActionName}
               </span>
             ) : null}
           </div>
@@ -1533,7 +1618,7 @@ export default function Home() {
               minHeight: 88,
             }}
           >
-            {plannerSummary || "(No planner decision yet)"}
+            {isEmbodiedMode ? (embodiedState.plannerSummary || "(No planner decision yet)") : "Social mode scaffolded: static webcam perception will appear here next."}
           </pre>
         </section>
 
@@ -1550,16 +1635,40 @@ export default function Home() {
               }}
             >
               <p style={{ margin: "0 0 10px 0" }}>
-                <strong>User:</strong> {inputTranscript || "(none)"}
+                <strong>User:</strong> {socialState.inputTranscript || "(none)"}
               </p>
               <p style={{ margin: 0 }}>
-                <strong>Agent:</strong> {outputTranscript || "(none)"}
+                <strong>Agent:</strong> {socialState.outputTranscript || "(none)"}
               </p>
             </div>
           </section>
         )}
 
-        {showDebug && (
+
+        {showDebug && isSocialMode && (
+          <section style={{ ...cardStyle(), padding: 20 }}>
+            <h2 style={{ marginTop: 0, fontSize: 20 }}>Webcam Mode</h2>
+            <div
+              style={{
+                background: "#f8fafc",
+                padding: 16,
+                borderRadius: 16,
+                border: "1px solid #e2e8f0",
+                fontSize: 14,
+                lineHeight: 1.6,
+              }}
+            >
+              <p style={{ margin: "0 0 10px 0" }}>
+                Static webcam mode is active.
+              </p>
+              <p style={{ margin: 0 }}>
+                Current social state: avatar {avatarConnected ? "connected" : "disconnected"}, bridge {bridgeConnected ? "connected" : "disconnected"}, mic {micOn ? "on" : "off"}.
+              </p>
+            </div>
+          </section>
+        )}
+
+        {showDebug && isEmbodiedMode && (
           <section
             style={{
               display: "grid",
@@ -1582,7 +1691,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {worldStateText || "(No state yet)"}
+                {embodiedState.worldStateText || "(No state yet)"}
               </pre>
             </div>
 
@@ -1601,7 +1710,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {lastQueryResultText || "(No query yet)"}
+                {embodiedState.lastQueryResultText || "(No query yet)"}
               </div>
             </div>
 
@@ -1641,13 +1750,13 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {eventLog || "(No events yet)"}
+                {embodiedState.eventLog || "(No events yet)"}
               </pre>
             </div>
           </section>
         )}
 
-        {showDebug && (
+        {showDebug && isEmbodiedMode && (
           <section
             style={{
               display: "grid",
@@ -1670,7 +1779,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {objects3dText || "(No 3D objects yet)"}
+                {embodiedState.objects3dText || "(No 3D objects yet)"}
               </pre>
             </div>
 
@@ -1689,7 +1798,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {cameraPoseText || "(No pose yet)"}
+                {embodiedState.cameraPoseText || "(No pose yet)"}
               </pre>
             </div>
 
@@ -1708,7 +1817,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {worldDebugText || "(No world debug yet)"}
+                {embodiedState.worldDebugText || "(No world debug yet)"}
               </pre>
             </div>
 
@@ -1726,9 +1835,9 @@ export default function Home() {
                   justifyContent: "center",
                 }}
               >
-                {depthDebugUrl ? (
+                {embodiedState.depthDebugUrl ? (
                   <img
-                    src={depthDebugUrl}
+                    src={embodiedState.depthDebugUrl}
                     alt="Depth debug"
                     style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
                   />
@@ -1753,7 +1862,7 @@ export default function Home() {
                   margin: 0,
                 }}
               >
-                {handsText || "(No hands yet)"}
+                {embodiedState.handsText || "(No hands yet)"}
               </pre>
             </div>
           </section>

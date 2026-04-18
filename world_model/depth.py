@@ -2,8 +2,8 @@
 
 This module calls a monocular depth model backed by Hugging Face
 Transformers and Depth Anything. If the model or dependency cannot be
-loaded, it falls back to a lightweight heuristic so the rest
-of the demo can still run.
+loaded, it falls back to a lightweight heuristic so the rest of the demo
+can still run.
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ from PIL import Image
 DEFAULT_MODEL_ID = os.environ.get("DEPTH_ANYTHING_MODEL", "LiheYoung/depth-anything-small-hf")
 USE_HEURISTIC_ONLY = os.environ.get("DEPTH_BACKEND", "depth-anything").lower() == "heuristic"
 
+DEPTH_MIN_RANGE = 0.35
+DEPTH_MAX_RANGE = 2.50
+LOW_PERCENTILE = 2.0
+HIGH_PERCENTILE = 98.0
+
 
 class DepthEstimator:
     """Lazy singleton wrapper around Depth Anything inference."""
@@ -37,6 +42,8 @@ class DepthEstimator:
         self._loaded = False
         self._processor = None
         self._model = None
+        self._last_norm_low: Optional[float] = None
+        self._last_norm_high: Optional[float] = None
 
     def ensure_loaded(self):
         if self._loaded or USE_HEURISTIC_ONLY:
@@ -66,6 +73,20 @@ class DepthEstimator:
                 self._processor = None
                 self._model = None
 
+    def _normalize_depth(self, raw_depth: np.ndarray) -> np.ndarray:
+        low = float(np.percentile(raw_depth, LOW_PERCENTILE))
+        high = float(np.percentile(raw_depth, HIGH_PERCENTILE))
+        if high <= low:
+            high = low + 1e-6
+
+        self._last_norm_low = low
+        self._last_norm_high = high
+
+        clipped = np.clip(raw_depth, low, high)
+        normalized = (clipped - low) / (high - low + 1e-6)
+        depth = DEPTH_MIN_RANGE + normalized * (DEPTH_MAX_RANGE - DEPTH_MIN_RANGE)
+        return depth.astype(np.float32)
+
     def estimate(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.size == 0:
             return np.zeros((1, 1), dtype=np.float32)
@@ -73,11 +94,13 @@ class DepthEstimator:
         if USE_HEURISTIC_ONLY:
             self.backend = "heuristic"
             self.status = "forced-heuristic"
-            return heuristic_depth(frame)
+            raw_depth = heuristic_depth(frame)
+            return self._normalize_depth(raw_depth)
 
         self.ensure_loaded()
         if not self._loaded or self._processor is None or self._model is None:
-            return heuristic_depth(frame)
+            raw_depth = heuristic_depth(frame)
+            return self._normalize_depth(raw_depth)
 
         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         inputs = self._processor(images=image, return_tensors="pt")
@@ -92,17 +115,12 @@ class DepthEstimator:
             outputs,
             target_sizes=[(image.height, image.width)],
         )
-        predicted_depth = post[0]["predicted_depth"]
-        depth_map = predicted_depth.detach().float().cpu().numpy().astype(np.float32)
+        raw_depth = post[0]["predicted_depth"].detach().float().cpu().numpy().astype(np.float32)
 
-        if depth_map.ndim != 2:
-            depth_map = np.squeeze(depth_map).astype(np.float32)
+        if raw_depth.ndim != 2:
+            raw_depth = np.squeeze(raw_depth).astype(np.float32)
 
-        # Normalize to a stable relative range expected by the rest of the pipeline.
-        depth_map = depth_map - float(depth_map.min())
-        depth_map = depth_map / (float(depth_map.max()) + 1e-6)
-        depth_map = 0.35 + depth_map * 2.15
-        return depth_map.astype(np.float32)
+        return self._normalize_depth(raw_depth)
 
     def get_debug_info(self) -> dict:
         return {
@@ -112,6 +130,10 @@ class DepthEstimator:
             "device": self.device,
             "load_time_ms": round(self.load_time_ms, 1) if self.load_time_ms is not None else None,
             "last_error": self.last_error,
+            "norm_low": round(self._last_norm_low, 4) if self._last_norm_low is not None else None,
+            "norm_high": round(self._last_norm_high, 4) if self._last_norm_high is not None else None,
+            "low_percentile": LOW_PERCENTILE,
+            "high_percentile": HIGH_PERCENTILE,
         }
 
 
@@ -142,7 +164,7 @@ _DEPTH_ESTIMATOR = DepthEstimator()
 
 
 def estimate_depth(frame: np.ndarray) -> np.ndarray:
-    """Estimate a relative depth map from a BGR frame."""
+    """Estimate a robust per-frame relative depth map from a BGR frame."""
     return _DEPTH_ESTIMATOR.estimate(frame)
 
 
