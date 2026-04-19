@@ -171,6 +171,8 @@ def detect_best_cup(frame):
 def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
     """Attach approximate 3D position fields to 2D detections."""
     sparse_map = camera_pose.get("sparse_map", []) if camera_pose else []
+    persistent_map = camera_pose.get("persistent_map", []) if camera_pose else []
+    stabilization_points = sparse_map or persistent_map
     enriched = []
     for det in detections:
         bbox = det.get("bbox")
@@ -183,7 +185,7 @@ def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
             depth_map,
             camera_pose,
             intrinsics,
-            sparse_points=sparse_map,
+            sparse_points=stabilization_points,
         )
         item = det.copy()
         item["position_camera_3d"] = lifted["position_camera_3d"]
@@ -351,6 +353,9 @@ async def handler(websocket):
                 "active_tracks": camera_pose.get("active_tracks", 0),
                 "sparse_landmark_count": camera_pose.get("sparse_landmark_count", 0),
                 "visible_landmark_count": camera_pose.get("visible_landmark_count", 0),
+                "persistent_landmark_count": camera_pose.get("persistent_landmark_count", 0),
+                "missing_landmark_count": camera_pose.get("missing_landmark_count", 0),
+                "landmark_lifecycle": camera_pose.get("landmark_lifecycle", {}),
                 "pose_source": camera_pose.get("pose_source", "unknown"),
                 "pnp_inliers": camera_pose.get("pnp_inliers", 0),
                 "pnp_reprojection_error": camera_pose.get("pnp_reprojection_error"),

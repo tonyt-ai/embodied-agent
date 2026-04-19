@@ -14,6 +14,9 @@ import numpy as np
 
 MAX_PNP_REPROJECTION_ERROR = 10.0
 MAX_PNP_POSITION_JUMP = 0.75
+MAX_MISSING_FRAMES = 45
+MAX_LANDMARKS = 300
+MIN_QUALITY_FOR_PERSISTENCE = 0.2
 
 
 class CameraTracker:
@@ -30,6 +33,13 @@ class CameraTracker:
         self.camera_position_world = np.zeros(3, dtype=np.float32)
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
+        self.lifecycle_stats = {
+            "created": 0,
+            "updated": 0,
+            "reobserved": 0,
+            "marked_missing": 0,
+            "pruned": 0,
+        }
 
     def reset(self):
         self.prev_gray = None
@@ -40,6 +50,13 @@ class CameraTracker:
         self.camera_position_world = np.zeros(3, dtype=np.float32)
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
+        self.lifecycle_stats = {
+            "created": 0,
+            "updated": 0,
+            "reobserved": 0,
+            "marked_missing": 0,
+            "pruned": 0,
+        }
 
     def _pose_dict(
         self,
@@ -68,9 +85,13 @@ class CameraTracker:
             "active_tracks": len(self.prev_track_ids),
             "sparse_landmark_count": len(self.landmarks),
             "visible_landmark_count": len(sparse_map),
+            "persistent_landmark_count": self._count_landmarks("persistent"),
+            "missing_landmark_count": self._count_landmarks("missing"),
+            "landmark_lifecycle": dict(self.lifecycle_stats),
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
+            "persistent_map": self._export_persistent_map(),
         }
 
     def _prepare(self, frame: np.ndarray) -> np.ndarray:
@@ -116,6 +137,75 @@ class CameraTracker:
         x = int(np.clip(round(u), 0, w - 1))
         y = int(np.clip(round(v), 0, h - 1))
         return float(depth_map[y, x])
+
+    def _count_landmarks(self, status: str) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("status") == status)
+
+    def _landmark_quality(self, hits: int, age: int, missed_frames: int) -> float:
+        hit_score = min(1.0, hits / 12.0)
+        age_penalty = min(0.35, age / 600.0)
+        miss_penalty = min(0.75, missed_frames / max(MAX_MISSING_FRAMES, 1))
+        return float(np.clip(hit_score - age_penalty - miss_penalty, 0.0, 1.0))
+
+    def _mark_unseen_landmarks_missing(self, visible_ids: set[int]):
+        for track_id, landmark in self.landmarks.items():
+            if track_id in visible_ids:
+                continue
+            if landmark.get("status") == "visible":
+                self.lifecycle_stats["marked_missing"] += 1
+            landmark["status"] = "missing"
+            landmark["missed_frames"] = self.frame_index - int(landmark.get("last_seen", self.frame_index))
+            age = self.frame_index - int(landmark.get("first_seen", self.frame_index))
+            landmark["age"] = age
+            landmark["quality"] = round(
+                self._landmark_quality(
+                    int(landmark.get("hits", 0)),
+                    age,
+                    int(landmark.get("missed_frames", 0)),
+                ),
+                3,
+            )
+
+    def _prune_landmarks(self):
+        stale_ids = []
+        for track_id, landmark in self.landmarks.items():
+            missed = int(landmark.get("missed_frames", 0))
+            quality = float(landmark.get("quality", 0.0))
+            if missed > MAX_MISSING_FRAMES or (missed > 8 and quality < MIN_QUALITY_FOR_PERSISTENCE):
+                stale_ids.append(track_id)
+
+        if len(self.landmarks) - len(stale_ids) > MAX_LANDMARKS:
+            candidates = sorted(
+                (
+                    (float(item.get("quality", 0.0)), int(item.get("last_seen", 0)), track_id)
+                    for track_id, item in self.landmarks.items()
+                    if track_id not in stale_ids
+                ),
+                key=lambda item: (item[0], item[1]),
+            )
+            overflow = len(self.landmarks) - len(stale_ids) - MAX_LANDMARKS
+            stale_ids.extend(track_id for _, _, track_id in candidates[:overflow])
+
+        for track_id in stale_ids:
+            if track_id in self.landmarks:
+                del self.landmarks[track_id]
+                self.lifecycle_stats["pruned"] += 1
+
+    def _export_visible_map(self):
+        visible = [
+            item for item in self.landmarks.values()
+            if item.get("status") == "visible"
+        ]
+        visible.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
+        return visible[:80]
+
+    def _export_persistent_map(self):
+        persistent = [
+            item for item in self.landmarks.values()
+            if item.get("status") in {"visible", "missing"} and item.get("quality", 0.0) >= MIN_QUALITY_FOR_PERSISTENCE
+        ]
+        persistent.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
+        return persistent[:160]
 
     def _lift_pixel(self, u: float, v: float, depth_value: float, intrinsics: dict) -> np.ndarray:
         fx = float(intrinsics["fx"])
@@ -212,9 +302,11 @@ class CameraTracker:
 
     def _update_landmarks(self, points, track_ids, depth_map, intrinsics):
         if depth_map is None or intrinsics is None or points is None or len(points) == 0:
-            return []
+            self._mark_unseen_landmarks_missing(set())
+            self._prune_landmarks()
+            return self._export_visible_map()
 
-        visible = []
+        visible_ids = set()
         for track_id, pt in zip(track_ids, points):
             u = float(pt[0])
             v = float(pt[1])
@@ -222,11 +314,22 @@ class CameraTracker:
             world_point = self._lift_pixel(u, v, depth_value, intrinsics)
 
             if track_id in self.landmarks:
+                was_missing = self.landmarks[track_id].get("status") == "missing"
                 prev = np.array(self.landmarks[track_id]["position_world"], dtype=np.float32)
                 world_point = 0.7 * prev + 0.3 * world_point
                 hits = self.landmarks[track_id]["hits"] + 1
+                first_seen = self.landmarks[track_id].get("first_seen", self.frame_index)
+                if was_missing:
+                    self.lifecycle_stats["reobserved"] += 1
+                else:
+                    self.lifecycle_stats["updated"] += 1
             else:
                 hits = 1
+                first_seen = self.frame_index
+                self.lifecycle_stats["created"] += 1
+
+            age = self.frame_index - int(first_seen)
+            quality = self._landmark_quality(hits, age, missed_frames=0)
 
             self.landmarks[track_id] = {
                 "id": track_id,
@@ -234,20 +337,18 @@ class CameraTracker:
                 "image_xy": [round(u, 1), round(v, 1)],
                 "depth": round(depth_value, 4),
                 "hits": hits,
+                "first_seen": first_seen,
                 "last_seen": self.frame_index,
+                "age": age,
+                "missed_frames": 0,
+                "status": "visible",
+                "quality": round(quality, 3),
             }
-            visible.append(self.landmarks[track_id])
+            visible_ids.add(track_id)
 
-        stale_ids = [
-            track_id
-            for track_id, item in self.landmarks.items()
-            if self.frame_index - item["last_seen"] > 30
-        ]
-        for track_id in stale_ids:
-            del self.landmarks[track_id]
-
-        visible.sort(key=lambda item: (item["hits"], item["last_seen"]), reverse=True)
-        return visible[:80]
+        self._mark_unseen_landmarks_missing(visible_ids)
+        self._prune_landmarks()
+        return self._export_visible_map()
 
     def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict) -> dict:
         """Refresh currently visible landmarks using a corrected depth map."""
@@ -261,7 +362,7 @@ class CameraTracker:
             return camera_pose
 
         points = self.prev_points.reshape(-1, 2)
-        visible = []
+        visible_ids = set()
         for track_id, pt in zip(self.prev_track_ids, points):
             if track_id not in self.landmarks:
                 continue
@@ -277,14 +378,28 @@ class CameraTracker:
             self.landmarks[track_id]["image_xy"] = [round(u, 1), round(v, 1)]
             self.landmarks[track_id]["depth"] = round(depth_value, 4)
             self.landmarks[track_id]["last_seen"] = self.frame_index
-            visible.append(self.landmarks[track_id])
+            self.landmarks[track_id]["status"] = "visible"
+            self.landmarks[track_id]["missed_frames"] = 0
+            first_seen = int(self.landmarks[track_id].get("first_seen", self.frame_index))
+            age = self.frame_index - first_seen
+            self.landmarks[track_id]["age"] = age
+            self.landmarks[track_id]["quality"] = round(
+                self._landmark_quality(int(self.landmarks[track_id].get("hits", 0)), age, 0),
+                3,
+            )
+            visible_ids.add(track_id)
 
-        visible.sort(key=lambda item: (item["hits"], item["last_seen"]), reverse=True)
-        sparse_map = visible[:80]
+        self._mark_unseen_landmarks_missing(visible_ids)
+        self._prune_landmarks()
+        sparse_map = self._export_visible_map()
         refined_pose = dict(camera_pose)
         refined_pose["sparse_map"] = sparse_map
+        refined_pose["persistent_map"] = self._export_persistent_map()
         refined_pose["visible_landmark_count"] = len(sparse_map)
         refined_pose["sparse_landmark_count"] = len(self.landmarks)
+        refined_pose["persistent_landmark_count"] = len(refined_pose["persistent_map"])
+        refined_pose["missing_landmark_count"] = self._count_landmarks("missing")
+        refined_pose["landmark_lifecycle"] = dict(self.lifecycle_stats)
         return refined_pose
 
     def update(self, frame: np.ndarray, depth_map=None, intrinsics=None) -> dict:
