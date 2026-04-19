@@ -181,6 +181,7 @@ export default function Home() {
   const frameIntervalRef = useRef<number | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const worldFrameInFlightRef = useRef(false);
+  const pendingWorldFrameRef = useRef<{ image: string; timestamp: number } | null>(null);
 
   const [worldStateText, setWorldStateText] = useState("");
   const [eventLog, setEventLog] = useState("");
@@ -192,6 +193,9 @@ export default function Home() {
   const [objects3dText, setObjects3dText] = useState("");
   const [sparseMapText, setSparseMapText] = useState("");
   const [sparseMapData, setSparseMapData] = useState<any[]>([]);
+  const [processedFrameUrl, setProcessedFrameUrl] = useState("");
+  const [processedFrameTimestamp, setProcessedFrameTimestamp] = useState<number | null>(null);
+  const [processedFrameLandmarks, setProcessedFrameLandmarks] = useState<any[]>([]);
   const [handsText, setHandsText] = useState("");
   const [worldDebugText, setWorldDebugText] = useState("");
   const [depthDebugUrl, setDepthDebugUrl] = useState("");
@@ -234,6 +238,9 @@ export default function Home() {
     cameraPoseText,
     objects3dText,
     sparseMapText,
+    processedFrameUrl,
+    processedFrameTimestamp,
+    processedFrameLandmarks,
     handsText,
     worldDebugText,
     depthDebugUrl,
@@ -260,6 +267,9 @@ export default function Home() {
     setObjects3dText("");
     setSparseMapText("");
     setSparseMapData([]);
+    setProcessedFrameUrl("");
+    setProcessedFrameTimestamp(null);
+    setProcessedFrameLandmarks([]);
     setHandsText("");
     setWorldDebugText("");
     setDepthDebugUrl("");
@@ -596,6 +606,15 @@ export default function Home() {
           setObjects3dText(JSON.stringify(objects3d, null, 2));
           setSparseMapText(JSON.stringify(sparseMap, null, 2));
           setSparseMapData(Array.isArray(sparseMap) ? sparseMap : []);
+          if (
+            pendingWorldFrameRef.current &&
+            pendingWorldFrameRef.current.timestamp === msg.frame_timestamp
+          ) {
+            setProcessedFrameUrl(pendingWorldFrameRef.current.image);
+            setProcessedFrameTimestamp(pendingWorldFrameRef.current.timestamp);
+            setProcessedFrameLandmarks(Array.isArray(sparseMap) ? sparseMap : []);
+            pendingWorldFrameRef.current = null;
+          }
           setHandsText(JSON.stringify(hands, null, 2));
           setWorldDebugText(JSON.stringify(worldDebug, null, 2));
           setDepthDebugUrl(depthDebug?.image ? `data:${depthDebug.mime_type};base64,${depthDebug.image}` : "");
@@ -971,15 +990,17 @@ export default function Home() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
       const t1 = performance.now();
+      const timestamp = Date.now();
 
       setCaptureMs(t1 - t0);
 
       worldFrameInFlightRef.current = true;
+      pendingWorldFrameRef.current = { image: dataUrl, timestamp };
       worldModelWsRef.current.send(
         JSON.stringify({
           type: "frame",
           image: dataUrl,
-          timestamp: Date.now(),
+          timestamp,
           capture_ms: t1 - t0,
         })
       );
@@ -988,6 +1009,7 @@ export default function Home() {
 
   function stopLocalCamera() {
     worldFrameInFlightRef.current = false;
+    pendingWorldFrameRef.current = null;
 
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
@@ -1892,6 +1914,89 @@ export default function Home() {
               >
                 {embodiedState.sparseMapText || "(No sparse map yet)"}
               </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                <h2 style={{ margin: 0, fontSize: 18 }}>Processed frame</h2>
+                <span
+                  style={{
+                    padding: "5px 9px",
+                    borderRadius: 999,
+                    background: "#f8fafc",
+                    border: "1px solid #e2e8f0",
+                    color: "#475569",
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  {processedFrameTimestamp !== null ? `${Date.now() - processedFrameTimestamp} ms old` : "waiting"}
+                </span>
+              </div>
+              <div
+                style={{
+                  position: "relative",
+                  height: 200,
+                  overflow: "hidden",
+                  background: "#020617",
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                }}
+              >
+                {embodiedState.processedFrameUrl ? (
+                  <>
+                    <img
+                      src={embodiedState.processedFrameUrl}
+                      alt="Processed frame"
+                      style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                    />
+                    {embodiedState.processedFrameLandmarks.slice(0, 80).map((point: any) => {
+                      const imageXY = point?.image_xy;
+                      if (!Array.isArray(imageXY) || imageXY.length < 2) return null;
+
+                      const px = Number(imageXY[0]);
+                      const py = Number(imageXY[1]);
+                      if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+
+                      const hits = Number(point?.hits || 0);
+                      const size = Math.max(4, Math.min(9, 3 + hits * 0.45));
+
+                      return (
+                        <div
+                          key={`processed-landmark-${point?.id ?? `${px}-${py}`}`}
+                          style={{
+                            position: "absolute",
+                            left: `${(px / 640) * 100}%`,
+                            top: `${(py / 360) * 100}%`,
+                            width: size,
+                            height: size,
+                            borderRadius: "50%",
+                            transform: "translate(-50%, -50%)",
+                            background: "rgba(56, 189, 248, 0.95)",
+                            border: "1px solid rgba(224, 242, 254, 0.95)",
+                            boxShadow: "0 0 0 3px rgba(56, 189, 248, 0.12)",
+                            pointerEvents: "none",
+                          }}
+                          title={`Landmark ${point?.id ?? "?"} • hits ${hits}`}
+                        />
+                      );
+                    })}
+                  </>
+                ) : (
+                  <span
+                    style={{
+                      color: "#cbd5e1",
+                      fontSize: 12,
+                      position: "absolute",
+                      left: "50%",
+                      top: "50%",
+                      transform: "translate(-50%, -50%)",
+                    }}
+                  >
+                    (No processed frame yet)
+                  </span>
+                )}
+              </div>
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
