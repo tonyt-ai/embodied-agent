@@ -181,7 +181,12 @@ export default function Home() {
   const frameIntervalRef = useRef<number | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const worldFrameInFlightRef = useRef(false);
-  const pendingWorldFrameRef = useRef<{ image: string; timestamp: number } | null>(null);
+  const pendingWorldFrameRef = useRef<{
+    image: string;
+    timestamp: number;
+    width: number;
+    height: number;
+  } | null>(null);
 
   const [worldStateText, setWorldStateText] = useState("");
   const [eventLog, setEventLog] = useState("");
@@ -196,6 +201,8 @@ export default function Home() {
   const [processedFrameUrl, setProcessedFrameUrl] = useState("");
   const [processedFrameTimestamp, setProcessedFrameTimestamp] = useState<number | null>(null);
   const [processedFrameLandmarks, setProcessedFrameLandmarks] = useState<any[]>([]);
+  const [processedFrameSize, setProcessedFrameSize] = useState({ width: 640, height: 360 });
+  const [depthDebugSize, setDepthDebugSize] = useState({ width: 160, height: 90 });
   const [handsText, setHandsText] = useState("");
   const [worldDebugText, setWorldDebugText] = useState("");
   const [depthDebugUrl, setDepthDebugUrl] = useState("");
@@ -241,6 +248,8 @@ export default function Home() {
     processedFrameUrl,
     processedFrameTimestamp,
     processedFrameLandmarks,
+    processedFrameSize,
+    depthDebugSize,
     handsText,
     worldDebugText,
     depthDebugUrl,
@@ -270,6 +279,8 @@ export default function Home() {
     setProcessedFrameUrl("");
     setProcessedFrameTimestamp(null);
     setProcessedFrameLandmarks([]);
+    setProcessedFrameSize({ width: 640, height: 360 });
+    setDepthDebugSize({ width: 160, height: 90 });
     setHandsText("");
     setWorldDebugText("");
     setDepthDebugUrl("");
@@ -613,11 +624,18 @@ export default function Home() {
             setProcessedFrameUrl(pendingWorldFrameRef.current.image);
             setProcessedFrameTimestamp(pendingWorldFrameRef.current.timestamp);
             setProcessedFrameLandmarks(Array.isArray(sparseMap) ? sparseMap : []);
+            setProcessedFrameSize({
+              width: pendingWorldFrameRef.current.width,
+              height: pendingWorldFrameRef.current.height,
+            });
             pendingWorldFrameRef.current = null;
           }
           setHandsText(JSON.stringify(hands, null, 2));
           setWorldDebugText(JSON.stringify(worldDebug, null, 2));
           setDepthDebugUrl(depthDebug?.image ? `data:${depthDebug.mime_type};base64,${depthDebug.image}` : "");
+          if (depthDebug?.width && depthDebug?.height) {
+            setDepthDebugSize({ width: depthDebug.width, height: depthDebug.height });
+          }
 
           if (typeof msg.frame_timestamp === "number") {
             const age = Date.now() - msg.frame_timestamp;
@@ -955,14 +973,11 @@ export default function Home() {
     if (!localCamRef.current) return;
 
     const video = localCamRef.current;
+    const maxCaptureWidth = 640;
 
     if (!frameCanvasRef.current) {
-      const canvas = document.createElement("canvas");
-      canvas.width = 640;
-      canvas.height = 360;
-      frameCanvasRef.current = canvas;
+      frameCanvasRef.current = document.createElement("canvas");
     }
-
     const canvas = frameCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -987,6 +1002,17 @@ export default function Home() {
       }
 
       const t0 = performance.now();
+      const sourceWidth = video.videoWidth || 640;
+      const sourceHeight = video.videoHeight || 360;
+      const scale = Math.min(1, maxCaptureWidth / Math.max(sourceWidth, 1));
+      const frameWidth = Math.max(1, Math.round(sourceWidth * scale));
+      const frameHeight = Math.max(1, Math.round(sourceHeight * scale));
+
+      if (canvas.width !== frameWidth || canvas.height !== frameHeight) {
+        canvas.width = frameWidth;
+        canvas.height = frameHeight;
+      }
+
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
       const t1 = performance.now();
@@ -995,12 +1021,19 @@ export default function Home() {
       setCaptureMs(t1 - t0);
 
       worldFrameInFlightRef.current = true;
-      pendingWorldFrameRef.current = { image: dataUrl, timestamp };
+      pendingWorldFrameRef.current = {
+        image: dataUrl,
+        timestamp,
+        width: frameWidth,
+        height: frameHeight,
+      };
       worldModelWsRef.current.send(
         JSON.stringify({
           type: "frame",
           image: dataUrl,
           timestamp,
+          frame_width: frameWidth,
+          frame_height: frameHeight,
           capture_ms: t1 - t0,
         })
       );
@@ -1533,7 +1566,7 @@ export default function Home() {
                 }}
               />
 
-              {isEmbodiedMode
+              {false && isEmbodiedMode
                 ? sparseMapData.slice(0, 60).map((point: any) => {
                     const imageXY = point?.image_xy;
                     if (!Array.isArray(imageXY) || imageXY.length < 2) return null;
@@ -1612,7 +1645,7 @@ export default function Home() {
                 );
               })() : null}
 
-              {isEmbodiedMode ? (
+              {false && isEmbodiedMode ? (
                 <div
                   style={{
                     position: "absolute",
@@ -1935,20 +1968,31 @@ export default function Home() {
               </div>
               <div
                 style={{
-                  position: "relative",
                   height: 200,
                   overflow: "hidden",
                   background: "#020617",
                   borderRadius: 14,
                   border: "1px solid #e2e8f0",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
                 }}
               >
                 {embodiedState.processedFrameUrl ? (
-                  <>
+                  <div
+                    style={{
+                      position: "relative",
+                      width: "fit-content",
+                      height: "100%",
+                      maxWidth: "100%",
+                      margin: "0 auto",
+                      background: "#020617",
+                    }}
+                  >
                     <img
                       src={embodiedState.processedFrameUrl}
                       alt="Processed frame"
-                      style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                      style={{ width: "auto", height: "100%", maxWidth: "100%", objectFit: "contain", display: "block" }}
                     />
                     {embodiedState.processedFrameLandmarks.slice(0, 80).map((point: any) => {
                       const imageXY = point?.image_xy;
@@ -1966,8 +2010,8 @@ export default function Home() {
                           key={`processed-landmark-${point?.id ?? `${px}-${py}`}`}
                           style={{
                             position: "absolute",
-                            left: `${(px / 640) * 100}%`,
-                            top: `${(py / 360) * 100}%`,
+                            left: `${(px / embodiedState.processedFrameSize.width) * 100}%`,
+                            top: `${(py / embodiedState.processedFrameSize.height) * 100}%`,
                             width: size,
                             height: size,
                             borderRadius: "50%",
@@ -1981,7 +2025,7 @@ export default function Home() {
                         />
                       );
                     })}
-                  </>
+                  </div>
                 ) : (
                   <span
                     style={{
@@ -2052,11 +2096,22 @@ export default function Home() {
                 }}
               >
                 {embodiedState.depthDebugUrl ? (
-                  <img
-                    src={embodiedState.depthDebugUrl}
-                    alt="Depth debug"
-                    style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
-                  />
+                  <div
+                    style={{
+                      position: "relative",
+                      width: "fit-content",
+                      height: "100%",
+                      maxWidth: "100%",
+                      margin: "0 auto",
+                      background: "#020617",
+                    }}
+                  >
+                    <img
+                      src={embodiedState.depthDebugUrl}
+                      alt="Depth debug"
+                      style={{ width: "auto", height: "100%", maxWidth: "100%", objectFit: "contain", display: "block" }}
+                    />
+                  </div>
                 ) : (
                   <span style={{ color: "#cbd5e1", fontSize: 12 }}>(No depth map yet)</span>
                 )}

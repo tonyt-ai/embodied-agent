@@ -198,11 +198,15 @@ def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
         enriched.append(item)
 
     return enriched
-def encode_depth_debug(depth_map, width=160, height=90):
+def encode_depth_debug(depth_map, max_width=160):
     """Encode a small false-color preview of the depth map for the UI."""
     if depth_map is None or depth_map.size == 0:
         return None
 
+    source_height, source_width = depth_map.shape[:2]
+    scale = min(1.0, float(max_width) / max(float(source_width), 1.0))
+    width = max(1, int(round(source_width * scale)))
+    height = max(1, int(round(source_height * scale)))
     preview = cv2.resize(depth_map, (width, height), interpolation=cv2.INTER_AREA)
     normalized = (preview - DEPTH_MIN_RANGE) / max(DEPTH_MAX_RANGE - DEPTH_MIN_RANGE, 1e-6)
     normalized = np.clip(normalized, 0.0, 1.0) * 255.0
