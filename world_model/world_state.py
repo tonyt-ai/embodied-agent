@@ -6,22 +6,16 @@ a history of observations. This state serves as the input to the
 world model, enabling prediction, planning, and goal-directed control.
 
 It is designed to work with the embodied-agent code
-(detection -> world_state.update -> planner).
+detection -> world_state.update -> planner.
 """
 
 import math
 import time
 
-# Dimensionality expected for DINO embeddings used in the state vector
 DINO_STATE_DIM = 32
 
 
 def cosine_similarity(a, b):
-    """Compute cosine similarity between two vectors safely.
-
-    Returns 0.0 when either vector is empty or near-zero to avoid
-    division-by-zero issues.
-    """
     if not a or not b:
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -33,23 +27,13 @@ def cosine_similarity(a, b):
 
 
 class WorldState:
-    """Tracks visible objects, assigns stable ids, and records changes.
-
-    Each tracked object is a dict with keys such as `id`, `label`, `x`,
-    `y`, `vx`, `vy`, `first_seen`, `last_seen`, optional `embedding`, and
-    `confidence`.
-    """
+    """Tracks visible objects, assigns stable ids, and records changes."""
 
     def __init__(self, collection_mode: bool = False):
-        # Active objects keyed by stable id
         self.objects = {}
         self.next_id = 1
-        # Short history of snapshots and recent change events
         self.history = []
         self.last_changes = []
-
-        # Modes and parameters: collection mode disables smoothing and
-        # shortens missing-timeouts to favor accurate dataset collection
         self.collection_mode = collection_mode
         self.max_missing_seconds = 1.2 if collection_mode else 3.0
         self.move_threshold = 0.03
@@ -59,25 +43,17 @@ class WorldState:
         self.objects_3d = []
         self.hands = []
         self.world_debug = {}
+        self.sparse_map = []
 
     def set_collection_mode(self, enabled: bool):
-        """Toggle collection mode which affects smoothing and timeouts."""
         self.collection_mode = enabled
         self.max_missing_seconds = 1.2 if enabled else 3.0
         self.smoothing_alpha = 0.0 if enabled else 0.20
 
     def _dist(self, a, b):
-        # Euclidean distance between two objects using x,y keys
         return math.sqrt((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2)
 
     def _match_existing(self, det, max_dist=0.30):
-        """Find an existing object id that best matches the detection.
-
-        Matching requires the same label, that the object is not marked
-        missing, and that the distance is within `max_dist`. A simple
-        scoring function prefers closer objects and slightly favors
-        higher confidence.
-        """
         best_id = None
         best_score = -1e9
 
@@ -85,43 +61,31 @@ class WorldState:
             if obj["label"] != det["label"]:
                 continue
             if obj.get("missing_since") is not None:
-                # currently flagged as missing
                 continue
 
             dist = self._dist(obj, det)
             if dist > max_dist:
                 continue
 
-            # score: closer distance -> higher score; small bonus for confidence
             score = (1.0 - dist) + 0.05 * obj.get("confidence", 0.0)
-
             if score > best_score:
                 best_score = score
                 best_id = obj_id
 
         return best_id
 
-    def update(self, detections, camera_pose=None, hands=None, world_debug=None):
-        """Update tracker with a list of detection dicts.
-
-        - New detections get a fresh id and an 'appeared' event.
-        - Matched detections are smoothed (unless smoothing disabled),
-          velocity is computed, and a 'moved' event is recorded when
-          displacement exceeds `move_threshold`.
-        - Objects not observed in this update get `missing_since` set
-          and are removed after `max_missing_seconds`.
-        """
+    def update(self, detections, camera_pose=None, hands=None, world_debug=None, sparse_map=None):
         now = time.time()
         updated_ids = set()
         self.camera_pose = camera_pose or self.camera_pose
         self.hands = hands or []
         self.world_debug = world_debug or {}
+        self.sparse_map = sparse_map or []
 
         for det in detections:
             matched_id = self._match_existing(det)
 
             if matched_id is None:
-                # New object: assign stable id and initialize metadata
                 matched_id = f"obj_{self.next_id}"
                 self.next_id += 1
 
@@ -138,6 +102,8 @@ class WorldState:
                 det["velocity_3d"] = det.get("velocity_3d", [0.0, 0.0, 0.0])
                 det["depth"] = det.get("depth", 0.0)
                 det["depth_confidence"] = det.get("depth_confidence", 0.0)
+                det["landmark_support"] = det.get("landmark_support", 0)
+                det["landmark_blend_weight"] = det.get("landmark_blend_weight", 0.0)
 
                 self.objects[matched_id] = det
                 self.last_changes.append({
@@ -147,7 +113,6 @@ class WorldState:
                     "time": now,
                 })
             else:
-                # Existing object: update timestamps and optionally smooth
                 prev = self.objects[matched_id]
                 det = det.copy()
                 det["id"] = matched_id
@@ -157,11 +122,9 @@ class WorldState:
 
                 alpha = self.smoothing_alpha
                 if alpha <= 0.0:
-                    # No smoothing: take raw detection
                     x = det["x"]
                     y = det["y"]
                 else:
-                    # Exponential smoothing between previous and new position
                     x = alpha * prev["x"] + (1 - alpha) * det["x"]
                     y = alpha * prev["y"] + (1 - alpha) * det["y"]
 
@@ -190,10 +153,17 @@ class WorldState:
                     "depth_confidence",
                     prev.get("depth_confidence", 0.0),
                 )
+                det["landmark_support"] = det.get(
+                    "landmark_support",
+                    prev.get("landmark_support", 0),
+                )
+                det["landmark_blend_weight"] = det.get(
+                    "landmark_blend_weight",
+                    prev.get("landmark_blend_weight", 0.0),
+                )
 
                 moved = math.sqrt(dx * dx + dy * dy)
                 if moved > self.move_threshold:
-                    # Record a concise moved event for downstream consumers
                     self.last_changes.append({
                         "type": "moved",
                         "label": det["label"],
@@ -207,15 +177,12 @@ class WorldState:
 
             updated_ids.add(matched_id)
 
-        # Mark objects that were not updated as missing and remove timed-out ones
         to_delete = []
         for obj_id, obj in self.objects.items():
             if obj_id in updated_ids:
                 continue
-
             if obj.get("missing_since") is None:
                 obj["missing_since"] = now
-
             if now - obj["missing_since"] > self.max_missing_seconds:
                 to_delete.append(obj_id)
 
@@ -229,12 +196,12 @@ class WorldState:
             })
             del self.objects[obj_id]
 
-        # Append a compact snapshot for debugging/visualization and keep history small
         snapshot = {
             "time": now,
             "objects": [obj.copy() for obj in self.objects.values()],
             "camera_pose": self.camera_pose,
             "hands": self.hands,
+            "sparse_map": self.sparse_map,
         }
         self.history.append(snapshot)
         self.history = self.history[-30:]
@@ -248,16 +215,13 @@ class WorldState:
                 "velocity_3d": obj.get("velocity_3d", [0.0, 0.0, 0.0]),
                 "depth": obj.get("depth", 0.0),
                 "depth_confidence": obj.get("depth_confidence", 0.0),
+                "landmark_support": obj.get("landmark_support", 0),
+                "landmark_blend_weight": obj.get("landmark_blend_weight", 0.0),
             }
             for obj in self.export_objects()
         ]
 
     def find_by_label(self, label):
-        """Return currently visible objects with given label sorted by recency.
-
-        Objects marked as missing are excluded. Sorting prefers more
-        recently seen and higher-confidence objects.
-        """
         matches = [
             o for o in self.objects.values()
             if o["label"] == label and o.get("missing_since") is None
@@ -272,17 +236,9 @@ class WorldState:
         return matches
 
     def get_recent_changes(self):
-        """Return the most recent change events (appeared/moved/disappeared)."""
         return self.last_changes[-10:]
 
     def get_state_vector(self):
-        """Produce a compact state vector for the highest-priority `cup`.
-
-        The returned vector has layout: [x, y, vx, vy, *embedding] where
-        the embedding is renormalized to unit length and padded/truncated
-        to `DINO_STATE_DIM`. If no cup is present a zero vector is
-        returned.
-        """
         matches = self.find_by_label("cup")
         if not matches:
             return [0.0] * (4 + DINO_STATE_DIM)
@@ -299,14 +255,12 @@ class WorldState:
         else:
             emb = emb[:DINO_STATE_DIM]
 
-        # renormalize embedding to unit length (avoid division by zero)
         norm = math.sqrt(sum(e * e for e in emb)) + 1e-6
         emb = [e / norm for e in emb]
 
         return [x, y, vx, vy, *emb]
 
     def export_objects(self):
-        """Return visible objects sorted with cups first for UI convenience."""
         objects = [
             obj for obj in self.objects.values()
             if obj.get("missing_since") is None
@@ -322,14 +276,13 @@ class WorldState:
         return objects
 
     def export_objects_3d(self):
-        """Return current visible objects with only 3D-centric fields."""
         return self.objects_3d
 
     def export_world_state(self):
-        """Return a compact world-state payload for websocket clients."""
         return {
             "camera_pose": self.camera_pose,
             "objects_3d": self.export_objects_3d(),
             "hands": self.hands,
             "world_debug": self.world_debug,
+            "sparse_map": self.sparse_map,
         }

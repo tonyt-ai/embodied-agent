@@ -180,6 +180,7 @@ export default function Home() {
   const localCamStreamRef = useRef<MediaStream | null>(null);
   const frameIntervalRef = useRef<number | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const worldFrameInFlightRef = useRef(false);
 
   const [worldStateText, setWorldStateText] = useState("");
   const [eventLog, setEventLog] = useState("");
@@ -189,6 +190,8 @@ export default function Home() {
   const [bestActionName, setBestActionName] = useState("");
   const [cameraPoseText, setCameraPoseText] = useState("");
   const [objects3dText, setObjects3dText] = useState("");
+  const [sparseMapText, setSparseMapText] = useState("");
+  const [sparseMapData, setSparseMapData] = useState<any[]>([]);
   const [handsText, setHandsText] = useState("");
   const [worldDebugText, setWorldDebugText] = useState("");
   const [depthDebugUrl, setDepthDebugUrl] = useState("");
@@ -203,6 +206,9 @@ export default function Home() {
   const [captureMs, setCaptureMs] = useState<number | null>(null);
   const [serverDecodeMs, setServerDecodeMs] = useState<number | null>(null);
   const [serverDetectMs, setServerDetectMs] = useState<number | null>(null);
+  const [serverDepthMs, setServerDepthMs] = useState<number | null>(null);
+  const [serverPoseMs, setServerPoseMs] = useState<number | null>(null);
+  const [serverWorldMs, setServerWorldMs] = useState<number | null>(null);
   const [serverTotalMs, setServerTotalMs] = useState<number | null>(null);
   const [pipelineAgeMs, setPipelineAgeMs] = useState<number | null>(null);
 
@@ -227,6 +233,7 @@ export default function Home() {
     bestActionName,
     cameraPoseText,
     objects3dText,
+    sparseMapText,
     handsText,
     worldDebugText,
     depthDebugUrl,
@@ -235,6 +242,9 @@ export default function Home() {
     captureMs,
     serverDecodeMs,
     serverDetectMs,
+    serverDepthMs,
+    serverPoseMs,
+    serverWorldMs,
     serverTotalMs,
     pipelineAgeMs,
   };
@@ -248,6 +258,8 @@ export default function Home() {
     setBestActionName("");
     setCameraPoseText("");
     setObjects3dText("");
+    setSparseMapText("");
+    setSparseMapData([]);
     setHandsText("");
     setWorldDebugText("");
     setDepthDebugUrl("");
@@ -258,6 +270,9 @@ export default function Home() {
     setCaptureMs(null);
     setServerDecodeMs(null);
     setServerDetectMs(null);
+    setServerDepthMs(null);
+    setServerPoseMs(null);
+    setServerWorldMs(null);
     setServerTotalMs(null);
     setPipelineAgeMs(null);
     lastSpokenRef.current = "";
@@ -567,9 +582,11 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "state_updated") {
+          worldFrameInFlightRef.current = false;
           const objects = msg.objects || [];
           const cameraPose = msg.camera_pose || null;
           const objects3d = msg.objects_3d || [];
+          const sparseMap = msg.sparse_map || [];
           const hands = msg.hands || [];
           const worldDebug = msg.world_debug || {};
           const depthDebug = msg.depth_debug || null;
@@ -577,6 +594,8 @@ export default function Home() {
           setWorldStateText(JSON.stringify({ objects }, null, 2));
           setCameraPoseText(JSON.stringify(cameraPose, null, 2));
           setObjects3dText(JSON.stringify(objects3d, null, 2));
+          setSparseMapText(JSON.stringify(sparseMap, null, 2));
+          setSparseMapData(Array.isArray(sparseMap) ? sparseMap : []);
           setHandsText(JSON.stringify(hands, null, 2));
           setWorldDebugText(JSON.stringify(worldDebug, null, 2));
           setDepthDebugUrl(depthDebug?.image ? `data:${depthDebug.mime_type};base64,${depthDebug.image}` : "");
@@ -590,6 +609,9 @@ export default function Home() {
           if (typeof msg.capture_ms === "number") setCaptureMs(msg.capture_ms);
           if (typeof msg.server_decode_ms === "number") setServerDecodeMs(msg.server_decode_ms);
           if (typeof msg.server_detect_ms === "number") setServerDetectMs(msg.server_detect_ms);
+          if (typeof msg.server_depth_ms === "number") setServerDepthMs(msg.server_depth_ms);
+          if (typeof msg.server_pose_ms === "number") setServerPoseMs(msg.server_pose_ms);
+          if (typeof msg.server_world_ms === "number") setServerWorldMs(msg.server_world_ms);
           if (typeof msg.server_total_ms === "number") setServerTotalMs(msg.server_total_ms);
           return;
         }
@@ -660,6 +682,7 @@ export default function Home() {
     };
 
     ws.onerror = () => {
+      worldFrameInFlightRef.current = false;
       if (showDebug) {
         setEventLog((prev) =>
           [`[WORLD MODEL ERROR]`, prev].filter(Boolean).join("\n\n").slice(0, 4000)
@@ -668,6 +691,7 @@ export default function Home() {
     };
 
     ws.onclose = () => {
+      worldFrameInFlightRef.current = false;
       if (showDebug) {
         setEventLog((prev) =>
           [`[WORLD MODEL CLOSED]`, prev].filter(Boolean).join("\n\n").slice(0, 4000)
@@ -931,10 +955,15 @@ export default function Home() {
 
     frameIntervalRef.current = window.setInterval(() => {
       if (!worldModelWsRef.current || worldModelWsRef.current.readyState !== WebSocket.OPEN) {
+        worldFrameInFlightRef.current = false;
         return;
       }
 
       if (video.readyState < 2) {
+        return;
+      }
+
+      if (worldFrameInFlightRef.current) {
         return;
       }
 
@@ -945,6 +974,7 @@ export default function Home() {
 
       setCaptureMs(t1 - t0);
 
+      worldFrameInFlightRef.current = true;
       worldModelWsRef.current.send(
         JSON.stringify({
           type: "frame",
@@ -957,6 +987,8 @@ export default function Home() {
   }
 
   function stopLocalCamera() {
+    worldFrameInFlightRef.current = false;
+
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = null;
@@ -1091,13 +1123,13 @@ export default function Home() {
   const captureModeLocked = avatarConnected || micOn || !!worldModelWsRef.current;
 
   const statusItems = [
-    { label: "Status", value: status, active: status !== "idle" },
-    { label: "Capture", value: isEmbodiedMode ? "embodied" : "social", active: true },
-    { label: "Avatar", value: avatarMode === "ai" ? "AI mode" : "Direct mode", active: true },
-    { label: "Avatar", value: avatarConnected ? "connected" : "disconnected", active: avatarConnected },
-    { label: "Gemini bridge", value: bridgeConnected ? "connected" : "disconnected", active: bridgeConnected },
-    { label: "Mic", value: micOn ? "on" : "off", active: micOn },
-    { label: "Avatar speaking", value: isSpeaking ? "yes" : "no", active: isSpeaking },
+    { id: "status", label: "Status", value: status, active: status !== "idle" },
+    { id: "capture", label: "Capture", value: isEmbodiedMode ? "embodied" : "social", active: true },
+    { id: "avatar-mode", label: "Avatar", value: avatarMode === "ai" ? "AI mode" : "Direct mode", active: true },
+    { id: "avatar-connection", label: "Avatar", value: avatarConnected ? "connected" : "disconnected", active: avatarConnected },
+    { id: "gemini-bridge", label: "Gemini bridge", value: bridgeConnected ? "connected" : "disconnected", active: bridgeConnected },
+    { id: "mic", label: "Mic", value: micOn ? "on" : "off", active: micOn },
+    { id: "avatar-speaking", label: "Avatar speaking", value: isSpeaking ? "yes" : "no", active: isSpeaking },
   ];
 
   return (
@@ -1184,7 +1216,7 @@ export default function Home() {
             <div style={{ display: "grid", gap: 10 }}>
               {statusItems.map((item) => (
                 <div
-                  key={item.label}
+                  key={item.id}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -1479,6 +1511,42 @@ export default function Home() {
                 }}
               />
 
+              {isEmbodiedMode
+                ? sparseMapData.slice(0, 60).map((point: any) => {
+                    const imageXY = point?.image_xy;
+                    if (!Array.isArray(imageXY) || imageXY.length < 2) return null;
+
+                    const px = Number(imageXY[0]);
+                    const py = Number(imageXY[1]);
+                    if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+
+                    const hits = Number(point?.hits || 0);
+                    const size = Math.max(4, Math.min(9, 3 + hits * 0.45));
+                    const opacity = Math.max(0.28, Math.min(0.88, 0.25 + hits * 0.06));
+
+                    return (
+                      <div
+                        key={`landmark-${point?.id ?? `${px}-${py}`}`}
+                        style={{
+                          position: "absolute",
+                          left: `${(px / 640) * 100}%`,
+                          top: `${(py / 360) * 100}%`,
+                          width: size,
+                          height: size,
+                          borderRadius: "50%",
+                          transform: "translate(-50%, -50%)",
+                          background: "rgba(56, 189, 248, 0.95)",
+                          border: "1px solid rgba(224, 242, 254, 0.95)",
+                          boxShadow: "0 0 0 3px rgba(56, 189, 248, 0.12)",
+                          opacity,
+                          pointerEvents: "none",
+                        }}
+                        title={`Landmark ${point?.id ?? "?"} • hits ${hits}`}
+                      />
+                    );
+                  })
+                : null}
+
               {isEmbodiedMode ? (
               <div
                 style={{
@@ -1521,6 +1589,27 @@ export default function Home() {
                   />
                 );
               })() : null}
+
+              {isEmbodiedMode ? (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 14,
+                    bottom: 14,
+                    padding: "6px 10px",
+                    borderRadius: 999,
+                    background: "rgba(2, 6, 23, 0.72)",
+                    color: "#e0f2fe",
+                    border: "1px solid rgba(125, 211, 252, 0.35)",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    letterSpacing: "0.02em",
+                    pointerEvents: "none",
+                  }}
+                >
+                  Sparse landmarks: {sparseMapData.length}
+                </div>
+              ) : null}
 
               {isEmbodiedMode && embodiedState.plannerSimulations &&
                 Object.entries(embodiedState.plannerSimulations).map(([sequenceKey, sim]: any) => {
@@ -1730,6 +1819,9 @@ export default function Home() {
                 <p><strong>Frame latency:</strong> {frameAgeMs !== null ? `${frameAgeMs} ms` : "n/a"}</p>
                 <p><strong>Server decode:</strong> {serverDecodeMs !== null ? `${serverDecodeMs.toFixed(1)} ms` : "n/a"}</p>
                 <p><strong>Server detect:</strong> {serverDetectMs !== null ? `${serverDetectMs.toFixed(1)} ms` : "n/a"}</p>
+                <p><strong>Server depth:</strong> {serverDepthMs !== null ? `${serverDepthMs.toFixed(1)} ms` : "n/a"}</p>
+                <p><strong>Server pose:</strong> {serverPoseMs !== null ? `${serverPoseMs.toFixed(1)} ms` : "n/a"}</p>
+                <p><strong>Server world:</strong> {serverWorldMs !== null ? `${serverWorldMs.toFixed(1)} ms` : "n/a"}</p>
                 <p><strong>Server total:</strong> {serverTotalMs !== null ? `${serverTotalMs.toFixed(1)} ms` : "n/a"}</p>
                 <p style={{ marginBottom: 0 }}><strong>Pipeline latency:</strong> {pipelineAgeMs !== null ? `${pipelineAgeMs} ms` : "n/a"}</p>
               </div>
@@ -1780,6 +1872,25 @@ export default function Home() {
                 }}
               >
                 {embodiedState.objects3dText || "(No 3D objects yet)"}
+              </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <h2 style={{ marginTop: 0, fontSize: 18 }}>Sparse 3D map</h2>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontSize: 12,
+                  height: 200,
+                  overflowY: "auto",
+                  background: "#f8fafc",
+                  padding: 14,
+                  borderRadius: 14,
+                  border: "1px solid #e2e8f0",
+                  margin: 0,
+                }}
+              >
+                {embodiedState.sparseMapText || "(No sparse map yet)"}
               </pre>
             </div>
 

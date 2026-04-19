@@ -57,7 +57,33 @@ def sample_depth_for_bbox(depth_map: np.ndarray, bbox) -> tuple[float, float]:
     return depth_value, confidence
 
 
-def lift_bbox_to_3d(bbox, depth_map: np.ndarray, camera_pose: dict, intrinsics: dict) -> dict:
+def _landmarks_in_bbox(sparse_points, bbox, width: int, height: int):
+    if not sparse_points:
+        return []
+
+    x1, y1, x2, y2 = _bbox_to_pixel_region(bbox, width, height)
+    matches = []
+    for point in sparse_points:
+        image_xy = point.get("image_xy")
+        position_world = point.get("position_world")
+        if not image_xy or not position_world or len(image_xy) < 2 or len(position_world) < 3:
+            continue
+
+        u, v = float(image_xy[0]), float(image_xy[1])
+        if x1 <= u <= x2 and y1 <= v <= y2:
+            matches.append(point)
+
+    matches.sort(key=lambda item: (item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
+    return matches
+
+
+def lift_bbox_to_3d(
+    bbox,
+    depth_map: np.ndarray,
+    camera_pose: dict,
+    intrinsics: dict,
+    sparse_points=None,
+) -> dict:
     """Convert a normalized bbox into camera-frame and world-frame 3D points."""
     height, width = depth_map.shape[:2]
     x1, y1, x2, y2 = _bbox_to_pixel_region(bbox, width, height)
@@ -77,11 +103,39 @@ def lift_bbox_to_3d(bbox, depth_map: np.ndarray, camera_pose: dict, intrinsics: 
     z_cam = depth_value
 
     camera_point = np.array([x_cam, y_cam, z_cam], dtype=np.float32)
-    world_translation = np.array(
-        camera_pose.get("translation_world", [0.0, 0.0, 0.0]),
+    camera_position_world = np.array(
+        camera_pose.get(
+            "camera_position_world",
+            camera_pose.get("translation_world", [0.0, 0.0, 0.0]),
+        ),
         dtype=np.float32,
     )
-    world_point = camera_point + world_translation
+    rotation_wc = np.array(
+        camera_pose.get("rotation_wc", np.eye(3, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    if rotation_wc.shape != (3, 3):
+        rotation_wc = np.eye(3, dtype=np.float32)
+
+    world_point = rotation_wc @ camera_point + camera_position_world
+    landmark_matches = _landmarks_in_bbox(sparse_points, bbox, width, height)
+    landmark_support = len(landmark_matches)
+    landmark_blend_weight = 0.0
+
+    if landmark_matches:
+        landmark_world = np.array(
+            [
+                np.array(item["position_world"], dtype=np.float32)
+                for item in landmark_matches[:12]
+            ],
+            dtype=np.float32,
+        )
+        landmark_point = landmark_world.mean(axis=0)
+        landmark_blend_weight = min(0.65, 0.15 + 0.1 * min(landmark_support, 5))
+        world_point = (1.0 - landmark_blend_weight) * world_point + landmark_blend_weight * landmark_point
+        camera_point = rotation_wc.T @ (world_point - camera_position_world)
+        depth_value = float(camera_point[2])
+        depth_confidence = max(depth_confidence, min(1.0, 0.35 + 0.1 * landmark_support))
 
     bbox_w = max(1, x2 - x1)
     bbox_h = max(1, y2 - y1)
@@ -95,4 +149,6 @@ def lift_bbox_to_3d(bbox, depth_map: np.ndarray, camera_pose: dict, intrinsics: 
         "depth_confidence": round(depth_confidence, 3),
         "bbox_area_ratio": round(size_ratio, 5),
         "pixel_center": [round(u, 1), round(v, 1)],
+        "landmark_support": landmark_support,
+        "landmark_blend_weight": round(landmark_blend_weight, 3),
     }

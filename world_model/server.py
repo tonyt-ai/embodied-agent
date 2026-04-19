@@ -21,7 +21,13 @@ import torch
 import websockets
 
 from camera_tracker import CameraTracker
-from depth import estimate_depth, summarize_depth
+from depth import (
+    DEPTH_MAX_RANGE,
+    DEPTH_MIN_RANGE,
+    estimate_depth,
+    stabilize_depth_with_anchors,
+    summarize_depth,
+)
 from dino_encoder import encode_bbox
 from lift_to_3d import infer_camera_intrinsics, lift_bbox_to_3d
 from pathlib import Path
@@ -164,6 +170,7 @@ def detect_best_cup(frame):
 
 def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
     """Attach approximate 3D position fields to 2D detections."""
+    sparse_map = camera_pose.get("sparse_map", []) if camera_pose else []
     enriched = []
     for det in detections:
         bbox = det.get("bbox")
@@ -171,7 +178,13 @@ def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
             enriched.append(det)
             continue
 
-        lifted = lift_bbox_to_3d(bbox, depth_map, camera_pose, intrinsics)
+        lifted = lift_bbox_to_3d(
+            bbox,
+            depth_map,
+            camera_pose,
+            intrinsics,
+            sparse_points=sparse_map,
+        )
         item = det.copy()
         item["position_camera_3d"] = lifted["position_camera_3d"]
         item["position_3d"] = lifted["position_world_3d"]
@@ -180,6 +193,8 @@ def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
         item["depth_confidence"] = lifted["depth_confidence"]
         item["pixel_center"] = lifted["pixel_center"]
         item["bbox_area_ratio"] = lifted["bbox_area_ratio"]
+        item["landmark_support"] = lifted["landmark_support"]
+        item["landmark_blend_weight"] = lifted["landmark_blend_weight"]
         enriched.append(item)
 
     return enriched
@@ -189,7 +204,8 @@ def encode_depth_debug(depth_map, width=160, height=90):
         return None
 
     preview = cv2.resize(depth_map, (width, height), interpolation=cv2.INTER_AREA)
-    normalized = cv2.normalize(preview, None, 0, 255, cv2.NORM_MINMAX)
+    normalized = (preview - DEPTH_MIN_RANGE) / max(DEPTH_MAX_RANGE - DEPTH_MIN_RANGE, 1e-6)
+    normalized = np.clip(normalized, 0.0, 1.0) * 255.0
     normalized = normalized.astype(np.uint8)
     heatmap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
     ok, encoded = cv2.imencode(".jpg", heatmap, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
@@ -307,13 +323,20 @@ async def handler(websocket):
             objects = await asyncio.to_thread(detect_best_cup, frame)
             t2 = time.perf_counter()
 
-            depth_map = estimate_depth(frame)
-            camera_pose = camera_tracker.update(frame)
+            raw_depth_map = estimate_depth(frame)
+            t_depth = time.perf_counter()
             intrinsics = infer_camera_intrinsics(frame.shape[1], frame.shape[0])
+            camera_pose = camera_tracker.update(frame, depth_map=raw_depth_map, intrinsics=intrinsics)
+            t_pose = time.perf_counter()
+            depth_map, depth_stabilization = stabilize_depth_with_anchors(raw_depth_map, camera_pose)
+            camera_pose = camera_tracker.refine_visible_landmarks(depth_map, intrinsics, camera_pose)
             objects = enrich_detections_with_3d(objects, depth_map, camera_pose, intrinsics)
             depth_debug = encode_depth_debug(depth_map)
+            t_world = time.perf_counter()
             world_debug = {
                 **summarize_depth(depth_map),
+                "raw_depth": summarize_depth(raw_depth_map),
+                "depth_stabilization": depth_stabilization,
                 "intrinsics": {
                     "fx": round(float(intrinsics["fx"]), 2),
                     "fy": round(float(intrinsics["fy"]), 2),
@@ -321,6 +344,21 @@ async def handler(websocket):
                     "cy": round(float(intrinsics["cy"]), 2),
                 },
                 "num_objects": len(objects),
+                "active_tracks": camera_pose.get("active_tracks", 0),
+                "sparse_landmark_count": camera_pose.get("sparse_landmark_count", 0),
+                "visible_landmark_count": camera_pose.get("visible_landmark_count", 0),
+                "pose_source": camera_pose.get("pose_source", "unknown"),
+                "pnp_inliers": camera_pose.get("pnp_inliers", 0),
+                "pnp_reprojection_error": camera_pose.get("pnp_reprojection_error"),
+                "camera_position_world": camera_pose.get("camera_position_world"),
+                "object_landmark_support": [
+                    {
+                        "label": obj.get("label"),
+                        "landmark_support": obj.get("landmark_support", 0),
+                        "landmark_blend_weight": obj.get("landmark_blend_weight", 0.0),
+                    }
+                    for obj in objects
+                ],
             }
 
             state.update(
@@ -328,6 +366,7 @@ async def handler(websocket):
                 camera_pose=camera_pose,
                 hands=[],
                 world_debug=world_debug,
+                sparse_map=camera_pose.get("sparse_map", []),
             )
             curr_state_vec = state.get_state_vector()
             saved = maybe_collect_transition(curr_state_vec)
@@ -342,11 +381,15 @@ async def handler(websocket):
                     "camera_pose": world_state_export["camera_pose"],
                     "hands": world_state_export["hands"],
                     "world_debug": world_state_export["world_debug"],
+                    "sparse_map": world_state_export["sparse_map"],
                     "depth_debug": depth_debug,
                     "frame_timestamp": data.get("timestamp"),
                     "capture_ms": data.get("capture_ms"),
                     "server_decode_ms": (t1 - t0) * 1000.0,
                     "server_detect_ms": (t2 - t1) * 1000.0,
+                    "server_depth_ms": (t_depth - t2) * 1000.0,
+                    "server_pose_ms": (t_pose - t_depth) * 1000.0,
+                    "server_world_ms": (t_world - t_pose) * 1000.0,
                     "server_total_ms": (t3 - t0) * 1000.0,
                     "server_time": time.time(),
                     "transition_saved": saved,

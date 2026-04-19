@@ -25,6 +25,11 @@ DEPTH_MIN_RANGE = 0.35
 DEPTH_MAX_RANGE = 2.50
 LOW_PERCENTILE = 2.0
 HIGH_PERCENTILE = 98.0
+MIN_STABILIZATION_ANCHORS = 6
+MIN_TRACKING_QUALITY = 0.25
+MIN_ACTIVE_TRACKS = 12
+MAX_ALLOWED_RELATIVE_ERROR = 0.35
+MAX_SHIFT_NORM_FOR_WEAK_ANCHORS = 0.08
 
 
 class DepthEstimator:
@@ -137,6 +142,170 @@ class DepthEstimator:
         }
 
 
+def _sample_depth_value(depth_map: np.ndarray, u: float, v: float) -> float:
+    h, w = depth_map.shape[:2]
+    x = int(np.clip(round(u), 0, w - 1))
+    y = int(np.clip(round(v), 0, h - 1))
+    return float(depth_map[y, x])
+
+
+class AnchorDepthStabilizer:
+    """Stabilize per-frame depth using visible 3D anchors and camera pose."""
+
+    def __init__(self):
+        self.reset_count = 0
+        self.last_reason = "cold-start"
+
+    def reset(self, reason: str):
+        self.reset_count += 1
+        self.last_reason = reason
+
+    def stabilize(self, depth_map: np.ndarray, camera_pose: dict | None) -> tuple[np.ndarray, dict]:
+        debug = {
+            "active": False,
+            "reason": "no-pose",
+            "anchors_considered": 0,
+            "anchors_used": 0,
+            "fit_scale": 1.0,
+            "fit_offset": 0.0,
+            "median_abs_error": None,
+            "median_relative_error": None,
+            "reset_count": self.reset_count,
+        }
+        if depth_map is None or depth_map.size == 0 or not camera_pose:
+            return depth_map, debug
+
+        status = str(camera_pose.get("status", "unknown"))
+        tracking_quality = float(camera_pose.get("tracking_quality", 0.0))
+        active_tracks = int(camera_pose.get("active_tracks", 0))
+        sparse_map = camera_pose.get("sparse_map", []) or []
+        camera_position_world = np.array(
+            camera_pose.get(
+                "camera_position_world",
+                camera_pose.get("translation_world", [0.0, 0.0, 0.0]),
+            ),
+            dtype=np.float32,
+        )
+        rotation_cw = np.array(
+            camera_pose.get("rotation_cw", np.eye(3, dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if rotation_cw.shape != (3, 3):
+            rotation_cw = np.eye(3, dtype=np.float32)
+        image_shift = camera_pose.get("image_shift_px", [0.0, 0.0]) or [0.0, 0.0]
+        h, w = depth_map.shape[:2]
+        diagonal = max(float(np.hypot(w, h)), 1.0)
+        shift_norm = float(np.hypot(float(image_shift[0]), float(image_shift[1])) / diagonal)
+        debug["image_shift_norm"] = round(shift_norm, 4)
+
+        if status in {"tracking-lost", "reseeded"}:
+            self.reset(status)
+            debug["reason"] = status
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
+
+        if tracking_quality < MIN_TRACKING_QUALITY or active_tracks < MIN_ACTIVE_TRACKS:
+            debug["reason"] = "low-tracking-confidence"
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
+
+        anchor_pairs = []
+        for point in sparse_map:
+            image_xy = point.get("image_xy")
+            position_world = point.get("position_world")
+            hits = int(point.get("hits", 0))
+            if not image_xy or not position_world or len(image_xy) < 2 or len(position_world) < 3:
+                continue
+            if hits < 2:
+                continue
+
+            world_point = np.array(position_world, dtype=np.float32)
+            camera_point = rotation_cw @ (world_point - camera_position_world)
+            expected_depth = float(camera_point[2])
+            if expected_depth <= 0.0:
+                continue
+
+            u = float(image_xy[0])
+            v = float(image_xy[1])
+            predicted_depth = _sample_depth_value(depth_map, u, v)
+            if not np.isfinite(predicted_depth) or predicted_depth <= 0.0:
+                continue
+
+            anchor_pairs.append((predicted_depth, expected_depth))
+
+        debug["anchors_considered"] = len(anchor_pairs)
+        if len(anchor_pairs) < MIN_STABILIZATION_ANCHORS:
+            debug["reason"] = "too-few-anchors"
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
+
+        if shift_norm > MAX_SHIFT_NORM_FOR_WEAK_ANCHORS and len(anchor_pairs) < (MIN_STABILIZATION_ANCHORS + 4):
+            debug["reason"] = "large-motion-weak-anchor-support"
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
+
+        pred = np.array([pair[0] for pair in anchor_pairs], dtype=np.float32)
+        expected = np.array([pair[1] for pair in anchor_pairs], dtype=np.float32)
+
+        if float(np.ptp(pred)) < 1e-5:
+            scale = float(np.median(expected) / max(np.median(pred), 1e-6))
+            offset = 0.0
+        else:
+            A = np.column_stack([pred, np.ones_like(pred)])
+            scale, offset = np.linalg.lstsq(A, expected, rcond=None)[0]
+            scale = float(scale)
+            offset = float(offset)
+
+        scale = float(np.clip(scale, 0.4, 2.5))
+        offset = float(np.clip(offset, -1.5, 1.5))
+
+        corrected_anchor_depths = scale * pred + offset
+        abs_error = np.abs(corrected_anchor_depths - expected)
+        rel_error = abs_error / np.maximum(expected, 1e-4)
+        inlier_mask = rel_error < MAX_ALLOWED_RELATIVE_ERROR
+
+        if int(inlier_mask.sum()) >= MIN_STABILIZATION_ANCHORS:
+            pred_inliers = pred[inlier_mask]
+            expected_inliers = expected[inlier_mask]
+            if float(np.ptp(pred_inliers)) >= 1e-5:
+                A = np.column_stack([pred_inliers, np.ones_like(pred_inliers)])
+                scale, offset = np.linalg.lstsq(A, expected_inliers, rcond=None)[0]
+                scale = float(np.clip(scale, 0.4, 2.5))
+                offset = float(np.clip(offset, -1.5, 1.5))
+                corrected_anchor_depths = scale * pred_inliers + offset
+                abs_error = np.abs(corrected_anchor_depths - expected_inliers)
+                rel_error = abs_error / np.maximum(expected_inliers, 1e-4)
+                anchors_used = int(inlier_mask.sum())
+            else:
+                anchors_used = len(pred_inliers)
+        else:
+            anchors_used = len(pred)
+
+        median_relative_error = float(np.median(rel_error)) if len(rel_error) else 1.0
+        if median_relative_error > MAX_ALLOWED_RELATIVE_ERROR:
+            debug["reason"] = "fit-rejected"
+            debug["median_relative_error"] = round(median_relative_error, 4)
+            debug["fit_scale"] = round(scale, 4)
+            debug["fit_offset"] = round(offset, 4)
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
+
+        corrected_map = scale * depth_map + offset
+        corrected_map = np.clip(corrected_map, DEPTH_MIN_RANGE, DEPTH_MAX_RANGE).astype(np.float32)
+
+        debug.update({
+            "active": True,
+            "reason": "anchors-and-pose",
+            "anchors_used": anchors_used,
+            "fit_scale": round(scale, 4),
+            "fit_offset": round(offset, 4),
+            "median_abs_error": round(float(np.median(abs_error)), 4) if len(abs_error) else None,
+            "median_relative_error": round(median_relative_error, 4),
+            "reset_count": self.reset_count,
+        })
+        return corrected_map, debug
+
+
 def heuristic_depth(frame: np.ndarray) -> np.ndarray:
     """Fallback pseudo-depth heuristic used when the real model is unavailable."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
@@ -161,11 +330,17 @@ def heuristic_depth(frame: np.ndarray) -> np.ndarray:
 
 
 _DEPTH_ESTIMATOR = DepthEstimator()
+_ANCHOR_DEPTH_STABILIZER = AnchorDepthStabilizer()
 
 
 def estimate_depth(frame: np.ndarray) -> np.ndarray:
     """Estimate a robust per-frame relative depth map from a BGR frame."""
     return _DEPTH_ESTIMATOR.estimate(frame)
+
+
+def stabilize_depth_with_anchors(depth_map: np.ndarray, camera_pose: dict | None) -> tuple[np.ndarray, dict]:
+    """Use visible anchors and current camera pose to stabilize depth."""
+    return _ANCHOR_DEPTH_STABILIZER.stabilize(depth_map, camera_pose)
 
 
 def summarize_depth(depth_map: np.ndarray) -> dict:
