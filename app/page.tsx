@@ -141,6 +141,14 @@ function statusDotColor(active: boolean) {
   return active ? "#16a34a" : "#94a3b8";
 }
 
+function parseJsonSafe<T>(value: string, fallback: T): T {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // Main React component for the app page. Manages refs, state, connections,
 // and UI rendering for the agent + world model + camera pipeline.
 export default function Home() {
@@ -225,6 +233,50 @@ export default function Home() {
 
   const isEmbodiedMode = captureMode === "embodied";
   const isSocialMode = captureMode === "social";
+  const cameraPoseData = parseJsonSafe<any>(cameraPoseText, null);
+  const persistentMapData = Array.isArray(cameraPoseData?.persistent_map)
+    ? cameraPoseData.persistent_map
+    : sparseMapData;
+  const cameraPositionWorld = Array.isArray(cameraPoseData?.camera_position_world)
+    ? cameraPoseData.camera_position_world
+    : [0, 0, 0];
+  const mapPoints3d = persistentMapData
+    .map((point: any) => {
+      const position = point?.position_world;
+      if (!Array.isArray(position) || position.length < 3) return null;
+      const x = Number(position[0]);
+      const y = Number(position[1]);
+      const z = Number(position[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+      return {
+        id: point?.id,
+        x,
+        y,
+        z,
+        quality: Number(point?.quality ?? 0),
+        hits: Number(point?.hits ?? 0),
+        status: point?.status || "visible",
+      };
+    })
+    .filter(Boolean) as Array<{
+      id: number | string;
+      x: number;
+      y: number;
+      z: number;
+      quality: number;
+      hits: number;
+      status: string;
+    }>;
+  const cameraMapX = Number(cameraPositionWorld[0] || 0);
+  const cameraMapZ = Number(cameraPositionWorld[2] || 0);
+  const mapExtent = Math.max(
+    0.25,
+    ...mapPoints3d.flatMap((point) => [
+      Math.abs(point.x - cameraMapX),
+      Math.abs(point.z - cameraMapZ),
+    ]),
+  );
+  const mapScale = 44 / mapExtent;
 
   const socialState = {
     inputTranscript,
@@ -1947,6 +1999,107 @@ export default function Home() {
               >
                 {embodiedState.sparseMapText || "(No sparse map yet)"}
               </pre>
+            </div>
+
+            <div style={{ ...cardStyle(), padding: 18 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                <h2 style={{ margin: 0, fontSize: 18 }}>3D map view</h2>
+                <span
+                  style={{
+                    padding: "5px 9px",
+                    borderRadius: 999,
+                    background: "#f8fafc",
+                    border: "1px solid #e2e8f0",
+                    color: "#475569",
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  {mapPoints3d.length} pts · {cameraPoseData?.pose_source || "no pose"}
+                </span>
+              </div>
+              <div
+                style={{
+                  position: "relative",
+                  height: 240,
+                  overflow: "hidden",
+                  borderRadius: 14,
+                  border: "1px solid #1e293b",
+                  background:
+                    "radial-gradient(circle at 50% 50%, rgba(14,165,233,0.16), transparent 35%), linear-gradient(180deg, #020617 0%, #0f172a 100%)",
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    backgroundImage:
+                      "linear-gradient(rgba(148,163,184,0.12) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.12) 1px, transparent 1px)",
+                    backgroundSize: "24px 24px",
+                  }}
+                />
+                <div
+                  style={{
+                    position: "absolute",
+                    left: "50%",
+                    top: "50%",
+                    width: 12,
+                    height: 12,
+                    borderRadius: "50%",
+                    transform: "translate(-50%, -50%)",
+                    background: "#f97316",
+                    border: "2px solid #ffedd5",
+                    boxShadow: "0 0 0 6px rgba(249,115,22,0.18)",
+                    zIndex: 3,
+                  }}
+                  title={`Camera x=${cameraMapX.toFixed(3)}, z=${cameraMapZ.toFixed(3)}`}
+                />
+                {mapPoints3d.slice(0, 160).map((point) => {
+                  const left = 50 + (point.x - cameraMapX) * mapScale;
+                  const top = 50 - (point.z - cameraMapZ) * mapScale;
+                  if (left < -10 || left > 110 || top < -10 || top > 110) return null;
+
+                  const isMissing = point.status === "missing";
+                  const size = Math.max(3, Math.min(8, 3 + point.hits * 0.25));
+                  const color = isMissing ? "#64748b" : point.quality > 0.6 ? "#22c55e" : "#38bdf8";
+
+                  return (
+                    <div
+                      key={`map-point-${point.id}`}
+                      style={{
+                        position: "absolute",
+                        left: `${left}%`,
+                        top: `${top}%`,
+                        width: size,
+                        height: size,
+                        borderRadius: "50%",
+                        transform: "translate(-50%, -50%)",
+                        background: color,
+                        opacity: isMissing ? 0.45 : 0.9,
+                        border: "1px solid rgba(255,255,255,0.6)",
+                        pointerEvents: "none",
+                      }}
+                      title={`Landmark ${point.id}: x=${point.x.toFixed(3)}, y=${point.y.toFixed(3)}, z=${point.z.toFixed(3)}, q=${point.quality.toFixed(2)}, ${point.status}`}
+                    />
+                  );
+                })}
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 12,
+                    bottom: 10,
+                    color: "#cbd5e1",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    background: "rgba(2,6,23,0.68)",
+                    border: "1px solid rgba(148,163,184,0.24)",
+                    borderRadius: 999,
+                    padding: "6px 10px",
+                  }}
+                >
+                  Top-down X/Z · radius ~{mapExtent.toFixed(2)}
+                </div>
+              </div>
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
