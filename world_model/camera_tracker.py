@@ -11,12 +11,112 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import os
+import sys
 
 MAX_PNP_REPROJECTION_ERROR = 10.0
 MAX_PNP_POSITION_JUMP = 0.75
 MAX_MISSING_FRAMES = 45
 MAX_LANDMARKS = 300
 MIN_QUALITY_FOR_PERSISTENCE = 0.2
+XFEAT_TOP_K = 1024
+XFEAT_MATCH_RADIUS_PX = 12.0
+MIN_REOBSERVATION_SIMILARITY = 0.78
+MAX_REOBSERVATION_DISTANCE_PX = 90.0
+
+
+class XFeatDescriptorBackend:
+    """Lazy XFeat descriptor adapter for landmark re-observation."""
+
+    def __init__(self, top_k: int = XFEAT_TOP_K):
+        self.top_k = top_k
+        self.available = False
+        self.status = "not-loaded"
+        self.last_error = None
+        self.device = "cpu"
+        self._model = None
+        self._torch = None
+        self._cache_id = None
+        self._cache_keypoints = None
+        self._cache_descriptors = None
+        self._load()
+
+    def _load(self):
+        xfeat_repo = os.environ.get("XFEAT_REPO")
+        if xfeat_repo and os.path.isdir(xfeat_repo) and xfeat_repo not in sys.path:
+            sys.path.insert(0, xfeat_repo)
+
+        try:
+            import torch
+            from modules.xfeat import XFeat
+
+            self._torch = torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._model = XFeat()
+            if hasattr(self._model, "to"):
+                self._model = self._model.to(self.device)
+            if hasattr(self._model, "eval"):
+                self._model.eval()
+            self.available = True
+            self.status = "ready"
+        except Exception as exc:
+            self.available = False
+            self.status = "unavailable"
+            self.last_error = str(exc)
+
+    def _compute(self, gray: np.ndarray):
+        if not self.available or self._model is None or self._torch is None:
+            return None, None
+
+        cache_id = id(gray)
+        if self._cache_id == cache_id:
+            return self._cache_keypoints, self._cache_descriptors
+
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        tensor = self._torch.from_numpy(rgb).permute(2, 0, 1).float()[None] / 255.0
+        tensor = tensor.to(self.device)
+
+        with self._torch.no_grad():
+            output = self._model.detectAndCompute(tensor, top_k=self.top_k)[0]
+
+        keypoints = output.get("keypoints")
+        descriptors = output.get("descriptors")
+        if keypoints is None or descriptors is None:
+            self._cache_id = cache_id
+            self._cache_keypoints = None
+            self._cache_descriptors = None
+            return None, None
+
+        keypoints = keypoints.detach().float().cpu().numpy()
+        descriptors = descriptors.detach().float().cpu().numpy()
+        norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
+        descriptors = descriptors / np.maximum(norms, 1e-6)
+
+        self._cache_id = cache_id
+        self._cache_keypoints = keypoints
+        self._cache_descriptors = descriptors
+        return keypoints, descriptors
+
+    def describe_at(self, gray: np.ndarray, u: float, v: float) -> np.ndarray | None:
+        keypoints, descriptors = self._compute(gray)
+        if keypoints is None or descriptors is None or len(keypoints) == 0:
+            return None
+
+        deltas = keypoints[:, :2] - np.array([u, v], dtype=np.float32)
+        distances = np.linalg.norm(deltas, axis=1)
+        idx = int(np.argmin(distances))
+        if float(distances[idx]) > XFEAT_MATCH_RADIUS_PX:
+            return None
+        return descriptors[idx].copy()
+
+    def debug_info(self) -> dict:
+        return {
+            "backend": "xfeat",
+            "status": self.status,
+            "device": self.device,
+            "top_k": self.top_k,
+            "last_error": self.last_error,
+        }
 
 
 class CameraTracker:
@@ -33,10 +133,12 @@ class CameraTracker:
         self.camera_position_world = np.zeros(3, dtype=np.float32)
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
+        self.descriptor_backend = XFeatDescriptorBackend()
         self.lifecycle_stats = {
             "created": 0,
             "updated": 0,
             "reobserved": 0,
+            "descriptor_reassociated": 0,
             "marked_missing": 0,
             "pruned": 0,
         }
@@ -54,6 +156,7 @@ class CameraTracker:
             "created": 0,
             "updated": 0,
             "reobserved": 0,
+            "descriptor_reassociated": 0,
             "marked_missing": 0,
             "pruned": 0,
         }
@@ -88,6 +191,7 @@ class CameraTracker:
             "persistent_landmark_count": self._count_landmarks("persistent"),
             "missing_landmark_count": self._count_landmarks("missing"),
             "landmark_lifecycle": dict(self.lifecycle_stats),
+            "descriptor_backend": self.descriptor_backend.debug_info(),
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
@@ -128,9 +232,28 @@ class CameraTracker:
         else:
             self.prev_points = np.concatenate([self.prev_points, new_points.astype(np.float32)], axis=0)
 
-        for _ in range(len(new_points)):
-            self.prev_track_ids.append(self.next_track_id)
-            self.next_track_id += 1
+        used_reobserved_ids = set(self.prev_track_ids)
+        for point in new_points.reshape(-1, 2):
+            matched_id, descriptor = self._match_missing_landmark(
+                gray,
+                float(point[0]),
+                float(point[1]),
+                used_reobserved_ids,
+            )
+            if matched_id is not None:
+                self.prev_track_ids.append(matched_id)
+                used_reobserved_ids.add(matched_id)
+                landmark = self.landmarks[matched_id]
+                landmark["status"] = "visible"
+                landmark["image_xy"] = [round(float(point[0]), 1), round(float(point[1]), 1)]
+                landmark["missed_frames"] = 0
+                landmark["last_seen"] = self.frame_index
+                if descriptor is not None:
+                    landmark["descriptor"] = descriptor
+                self.lifecycle_stats["descriptor_reassociated"] += 1
+            else:
+                self.prev_track_ids.append(self.next_track_id)
+                self.next_track_id += 1
 
     def _sample_depth(self, depth_map: np.ndarray, u: float, v: float) -> float:
         h, w = depth_map.shape[:2]
@@ -138,7 +261,62 @@ class CameraTracker:
         y = int(np.clip(round(v), 0, h - 1))
         return float(depth_map[y, x])
 
+    def _extract_descriptor(self, gray: np.ndarray, u: float, v: float) -> np.ndarray | None:
+        return self.descriptor_backend.describe_at(gray, u, v)
+
+    def _descriptor_similarity(self, a, b) -> float:
+        if a is None or b is None:
+            return -1.0
+        return float(np.dot(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)))
+
+    def _match_missing_landmark(self, gray: np.ndarray, u: float, v: float, used_ids: set[int]) -> tuple[int | None, np.ndarray | None]:
+        descriptor = self._extract_descriptor(gray, u, v)
+        if descriptor is None:
+            return None, None
+
+        best_id = None
+        best_score = MIN_REOBSERVATION_SIMILARITY
+        for track_id, landmark in self.landmarks.items():
+            if track_id in used_ids:
+                continue
+            if landmark.get("status") != "missing":
+                continue
+            if int(landmark.get("missed_frames", 0)) > MAX_MISSING_FRAMES:
+                continue
+            if "descriptor" not in landmark:
+                continue
+
+            image_xy = landmark.get("image_xy")
+            if image_xy and len(image_xy) >= 2:
+                distance = float(np.hypot(u - float(image_xy[0]), v - float(image_xy[1])))
+                if distance > MAX_REOBSERVATION_DISTANCE_PX:
+                    continue
+
+            similarity = self._descriptor_similarity(descriptor, landmark.get("descriptor"))
+            if similarity < MIN_REOBSERVATION_SIMILARITY:
+                continue
+            recency_bonus = max(0.0, 1.0 - int(landmark.get("missed_frames", 0)) / max(MAX_MISSING_FRAMES, 1))
+            score = similarity + 0.05 * recency_bonus
+            if score > best_score:
+                best_score = score
+                best_id = track_id
+
+        return best_id, descriptor
+
+    def _public_landmark(self, landmark: dict) -> dict:
+        return {
+            key: value
+            for key, value in landmark.items()
+            if key != "descriptor"
+        }
+
     def _count_landmarks(self, status: str) -> int:
+        if status == "persistent":
+            return sum(
+                1 for item in self.landmarks.values()
+                if item.get("status") in {"visible", "missing"}
+                and float(item.get("quality", 0.0)) >= MIN_QUALITY_FOR_PERSISTENCE
+            )
         return sum(1 for item in self.landmarks.values() if item.get("status") == status)
 
     def _landmark_quality(self, hits: int, age: int, missed_frames: int) -> float:
@@ -193,7 +371,7 @@ class CameraTracker:
 
     def _export_visible_map(self):
         visible = [
-            item for item in self.landmarks.values()
+            self._public_landmark(item) for item in self.landmarks.values()
             if item.get("status") == "visible"
         ]
         visible.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
@@ -201,7 +379,7 @@ class CameraTracker:
 
     def _export_persistent_map(self):
         persistent = [
-            item for item in self.landmarks.values()
+            self._public_landmark(item) for item in self.landmarks.values()
             if item.get("status") in {"visible", "missing"} and item.get("quality", 0.0) >= MIN_QUALITY_FOR_PERSISTENCE
         ]
         persistent.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
@@ -300,7 +478,7 @@ class CameraTracker:
             "reprojection_error": reprojection_error,
         }
 
-    def _update_landmarks(self, points, track_ids, depth_map, intrinsics):
+    def _update_landmarks(self, points, track_ids, depth_map, intrinsics, gray=None):
         if depth_map is None or intrinsics is None or points is None or len(points) == 0:
             self._mark_unseen_landmarks_missing(set())
             self._prune_landmarks()
@@ -312,6 +490,7 @@ class CameraTracker:
             v = float(pt[1])
             depth_value = self._sample_depth(depth_map, u, v)
             world_point = self._lift_pixel(u, v, depth_value, intrinsics)
+            descriptor = self._extract_descriptor(gray, u, v) if gray is not None else None
 
             if track_id in self.landmarks:
                 was_missing = self.landmarks[track_id].get("status") == "missing"
@@ -344,6 +523,8 @@ class CameraTracker:
                 "status": "visible",
                 "quality": round(quality, 3),
             }
+            if descriptor is not None:
+                self.landmarks[track_id]["descriptor"] = descriptor
             visible_ids.add(track_id)
 
         self._mark_unseen_landmarks_missing(visible_ids)
@@ -371,12 +552,15 @@ class CameraTracker:
             v = float(pt[1])
             depth_value = self._sample_depth(depth_map, u, v)
             world_point = self._lift_pixel(u, v, depth_value, intrinsics)
+            descriptor = self._extract_descriptor(self.prev_gray, u, v) if self.prev_gray is not None else None
             prev = np.array(self.landmarks[track_id]["position_world"], dtype=np.float32)
             world_point = 0.75 * prev + 0.25 * world_point
 
             self.landmarks[track_id]["position_world"] = np.round(world_point, 4).tolist()
             self.landmarks[track_id]["image_xy"] = [round(u, 1), round(v, 1)]
             self.landmarks[track_id]["depth"] = round(depth_value, 4)
+            if descriptor is not None:
+                self.landmarks[track_id]["descriptor"] = descriptor
             self.landmarks[track_id]["last_seen"] = self.frame_index
             self.landmarks[track_id]["status"] = "visible"
             self.landmarks[track_id]["missed_frames"] = 0
@@ -505,7 +689,7 @@ class CameraTracker:
 
         delta = self.camera_position_world - prev_camera_position
 
-        sparse_map = self._update_landmarks(good_new, good_ids, depth_map, intrinsics)
+        sparse_map = self._update_landmarks(good_new, good_ids, depth_map, intrinsics, gray=gray)
 
         self.prev_gray = gray
         self.prev_points = good_new.reshape(-1, 1, 2).astype(np.float32) if len(good_new) else None
