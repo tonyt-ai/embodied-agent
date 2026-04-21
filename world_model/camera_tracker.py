@@ -39,6 +39,7 @@ BA_LITE_MAX_UPDATES_PER_KEYFRAME = 80
 COVISIBILITY_MIN_SHARED = 8
 LOCAL_MAP_MAX_KEYFRAMES = 5
 LOCAL_MAP_MAX_LANDMARKS = 180
+MIN_LOCAL_PNP_ANCHORS = 6
 
 
 class XFeatDescriptorBackend:
@@ -158,6 +159,7 @@ class CameraTracker:
         self.covisibility_graph = {}
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
+        self.last_pnp_anchor_scope = "none"
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
@@ -190,6 +192,7 @@ class CameraTracker:
         self.covisibility_graph = {}
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
+        self.last_pnp_anchor_scope = "none"
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
@@ -245,10 +248,13 @@ class CameraTracker:
             "latest_covisible_keyframes": self._latest_covisible_keyframes(),
             "local_keyframes": list(self.local_keyframe_ids),
             "local_landmark_count": len(self.local_landmark_ids),
+            "local_visible_landmark_count": len(self._export_local_visible_map()),
+            "pnp_anchor_scope": self.last_pnp_anchor_scope,
             "ba_lite": dict(self.ba_lite_stats),
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
+            "local_sparse_map": self._export_local_visible_map(),
             "persistent_map": self._export_persistent_map(),
         }
 
@@ -527,7 +533,32 @@ class CameraTracker:
             self._public_landmark(item) for item in self.landmarks.values()
             if item.get("status") == "visible"
         ]
-        visible.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
+        visible.sort(
+            key=lambda item: (
+                item.get("is_local_map", False),
+                item.get("is_stable", False),
+                item.get("quality", 0.0),
+                item.get("hits", 0),
+                item.get("last_seen", 0),
+            ),
+            reverse=True,
+        )
+        return visible[:80]
+
+    def _export_local_visible_map(self):
+        visible = [
+            self._public_landmark(item) for track_id, item in self.landmarks.items()
+            if track_id in self.local_landmark_ids and item.get("status") == "visible"
+        ]
+        visible.sort(
+            key=lambda item: (
+                item.get("is_stable", False),
+                item.get("quality", 0.0),
+                item.get("hits", 0),
+                item.get("last_seen", 0),
+            ),
+            reverse=True,
+        )
         return visible[:80]
 
     def _export_persistent_map(self):
@@ -802,8 +833,7 @@ class CameraTracker:
         if intrinsics is None or points is None or len(points) < 6:
             return None
 
-        object_points = []
-        image_points = []
+        candidates = []
         for track_id, pt in zip(track_ids, points):
             landmark = self.landmarks.get(track_id)
             if not landmark:
@@ -811,14 +841,30 @@ class CameraTracker:
             world_point = landmark.get("position_world")
             if not world_point or len(world_point) < 3:
                 continue
-            object_points.append(world_point)
-            image_points.append([float(pt[0]), float(pt[1])])
+            candidates.append({
+                "track_id": track_id,
+                "object_point": world_point,
+                "image_point": [float(pt[0]), float(pt[1])],
+                "is_local": track_id in self.local_landmark_ids,
+                "is_stable": bool(landmark.get("is_stable")),
+            })
 
-        if len(object_points) < 6:
+        if len(candidates) < 6:
             return None
 
-        object_points = np.asarray(object_points, dtype=np.float32)
-        image_points = np.asarray(image_points, dtype=np.float32)
+        local_candidates = [item for item in candidates if item["is_local"]]
+        stable_candidates = [item for item in candidates if item["is_stable"]]
+        if len(local_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = local_candidates
+            anchor_scope = "local-map"
+        elif len(stable_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = stable_candidates
+            anchor_scope = "stable"
+        else:
+            anchor_scope = "all-visible"
+
+        object_points = np.asarray([item["object_point"] for item in candidates], dtype=np.float32)
+        image_points = np.asarray([item["image_point"] for item in candidates], dtype=np.float32)
         camera_matrix = self._camera_matrix(intrinsics)
         dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
@@ -867,6 +913,8 @@ class CameraTracker:
             "camera_position_world": camera_position_world,
             "inliers": 0 if inliers is None else int(len(inliers)),
             "reprojection_error": reprojection_error,
+            "anchor_scope": anchor_scope,
+            "anchors_considered": len(candidates),
         }
 
     def _update_landmarks(self, points, track_ids, depth_map, intrinsics, gray=None):
@@ -888,12 +936,13 @@ class CameraTracker:
             )
             descriptor = self._extract_descriptor(gray, u, v) if should_update_descriptor else None
 
-            if track_id in self.landmarks:
-                was_missing = self.landmarks[track_id].get("status") == "missing"
-                prev = np.array(self.landmarks[track_id]["position_world"], dtype=np.float32)
+            previous_landmark = self.landmarks.get(track_id, {})
+            if previous_landmark:
+                was_missing = previous_landmark.get("status") == "missing"
+                prev = np.array(previous_landmark["position_world"], dtype=np.float32)
                 world_point = 0.7 * prev + 0.3 * world_point
-                hits = self.landmarks[track_id]["hits"] + 1
-                first_seen = self.landmarks[track_id].get("first_seen", self.frame_index)
+                hits = previous_landmark["hits"] + 1
+                first_seen = previous_landmark.get("first_seen", self.frame_index)
                 if was_missing:
                     self.lifecycle_stats["reobserved"] += 1
                 else:
@@ -906,7 +955,22 @@ class CameraTracker:
             age = self.frame_index - int(first_seen)
             quality = self._landmark_quality(hits, age, missed_frames=0)
 
-            self.landmarks[track_id] = {
+            preserved = {
+                key: previous_landmark[key]
+                for key in (
+                    "descriptor",
+                    "observations",
+                    "observation_count",
+                    "mean_reprojection_error",
+                    "is_stable",
+                    "is_local_map",
+                    "ba_lite_refined",
+                    "ba_lite_error_before",
+                    "ba_lite_error_after",
+                )
+                if key in previous_landmark
+            }
+            landmark_update = {
                 "id": track_id,
                 "position_world": np.round(world_point, 4).tolist(),
                 "image_xy": [round(u, 1), round(v, 1)],
@@ -919,8 +983,10 @@ class CameraTracker:
                 "status": "visible",
                 "quality": round(quality, 3),
             }
+            landmark_update.update(preserved)
             if descriptor is not None:
-                self.landmarks[track_id]["descriptor"] = descriptor
+                landmark_update["descriptor"] = descriptor
+            self.landmarks[track_id] = landmark_update
             visible_ids.add(track_id)
 
         self._mark_unseen_landmarks_missing(visible_ids)
@@ -978,8 +1044,10 @@ class CameraTracker:
         sparse_map = self._export_visible_map()
         refined_pose = dict(camera_pose)
         refined_pose["sparse_map"] = sparse_map
+        refined_pose["local_sparse_map"] = self._export_local_visible_map()
         refined_pose["persistent_map"] = self._export_persistent_map()
         refined_pose["visible_landmark_count"] = len(sparse_map)
+        refined_pose["local_visible_landmark_count"] = len(refined_pose["local_sparse_map"])
         refined_pose["sparse_landmark_count"] = len(self.landmarks)
         refined_pose["persistent_landmark_count"] = len(refined_pose["persistent_map"])
         refined_pose["missing_landmark_count"] = self._count_landmarks("missing")
@@ -1067,6 +1135,7 @@ class CameraTracker:
         pose_source = "flow"
         pnp_inliers = 0
         pnp_error = None
+        self.last_pnp_anchor_scope = "none"
         pnp_pose = self._estimate_pose_from_anchors(good_new, good_ids, intrinsics)
         pnp_position_ok = False
         if pnp_pose is not None:
@@ -1082,6 +1151,7 @@ class CameraTracker:
             self.camera_position_world = pnp_pose["camera_position_world"]
             pnp_inliers = pnp_pose["inliers"]
             pnp_error = pnp_pose["reprojection_error"]
+            self.last_pnp_anchor_scope = pnp_pose.get("anchor_scope", "unknown")
             pose_source = "pnp"
         else:
             self.camera_position_world += flow_delta

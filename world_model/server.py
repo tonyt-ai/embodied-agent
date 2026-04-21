@@ -170,9 +170,10 @@ def detect_best_cup(frame):
 
 def enrich_detections_with_3d(detections, depth_map, camera_pose, intrinsics):
     """Attach approximate 3D position fields to 2D detections."""
+    local_sparse_map = camera_pose.get("local_sparse_map", []) if camera_pose else []
     sparse_map = camera_pose.get("sparse_map", []) if camera_pose else []
     persistent_map = camera_pose.get("persistent_map", []) if camera_pose else []
-    stabilization_points = sparse_map or persistent_map
+    stabilization_points = local_sparse_map or sparse_map or persistent_map
     enriched = []
     for det in detections:
         bbox = det.get("bbox")
@@ -353,6 +354,7 @@ async def handler(websocket):
                 "active_tracks": camera_pose.get("active_tracks", 0),
                 "sparse_landmark_count": camera_pose.get("sparse_landmark_count", 0),
                 "visible_landmark_count": camera_pose.get("visible_landmark_count", 0),
+                "local_visible_landmark_count": camera_pose.get("local_visible_landmark_count", 0),
                 "persistent_landmark_count": camera_pose.get("persistent_landmark_count", 0),
                 "missing_landmark_count": camera_pose.get("missing_landmark_count", 0),
                 "landmark_lifecycle": camera_pose.get("landmark_lifecycle", {}),
@@ -364,6 +366,7 @@ async def handler(websocket):
                 "latest_covisible_keyframes": camera_pose.get("latest_covisible_keyframes", []),
                 "local_keyframes": camera_pose.get("local_keyframes", []),
                 "local_landmark_count": camera_pose.get("local_landmark_count", 0),
+                "pnp_anchor_scope": camera_pose.get("pnp_anchor_scope", "none"),
                 "ba_lite": camera_pose.get("ba_lite", {}),
                 "pose_source": camera_pose.get("pose_source", "unknown"),
                 "pnp_inliers": camera_pose.get("pnp_inliers", 0),
@@ -400,6 +403,7 @@ async def handler(websocket):
                     "hands": world_state_export["hands"],
                     "world_debug": world_state_export["world_debug"],
                     "sparse_map": world_state_export["sparse_map"],
+                    "local_sparse_map": camera_pose.get("local_sparse_map", []),
                     "depth_debug": depth_debug,
                     "frame_timestamp": data.get("timestamp"),
                     "capture_ms": data.get("capture_ms"),

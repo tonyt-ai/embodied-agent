@@ -171,6 +171,7 @@ class AnchorDepthStabilizer:
             "median_abs_error": None,
             "median_relative_error": None,
             "reset_count": self.reset_count,
+            "anchor_source": "none",
         }
         if depth_map is None or depth_map.size == 0 or not camera_pose:
             return depth_map, debug
@@ -178,6 +179,7 @@ class AnchorDepthStabilizer:
         status = str(camera_pose.get("status", "unknown"))
         tracking_quality = float(camera_pose.get("tracking_quality", 0.0))
         active_tracks = int(camera_pose.get("active_tracks", 0))
+        local_sparse_map = camera_pose.get("local_sparse_map", []) or []
         sparse_map = camera_pose.get("sparse_map", []) or []
         camera_position_world = np.array(
             camera_pose.get(
@@ -209,11 +211,17 @@ class AnchorDepthStabilizer:
             debug["reset_count"] = self.reset_count
             return depth_map, debug
 
+        anchor_source = "local-map" if len(local_sparse_map) >= MIN_STABILIZATION_ANCHORS else "visible-map"
+        anchor_map = local_sparse_map if anchor_source == "local-map" else sparse_map
+        debug["anchor_source"] = anchor_source
+
         anchor_pairs = []
-        for point in sparse_map:
+        for point in anchor_map:
             image_xy = point.get("image_xy")
             position_world = point.get("position_world")
             hits = int(point.get("hits", 0))
+            if anchor_source == "visible-map" and point.get("is_local_map"):
+                hits += 1
             if not image_xy or not position_world or len(image_xy) < 2 or len(position_world) < 3:
                 continue
             if hits < 2:
