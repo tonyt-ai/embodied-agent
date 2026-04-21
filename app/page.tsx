@@ -269,6 +269,8 @@ export default function Home() {
     }>;
   const cameraMapX = Number(cameraPositionWorld[0] || 0);
   const cameraMapZ = Number(cameraPositionWorld[2] || 0);
+  const landmarkLifecycle = cameraPoseData?.landmark_lifecycle || {};
+  const descriptorBackend = cameraPoseData?.descriptor_backend || {};
   const mapExtent = Math.max(
     0.25,
     ...mapPoints3d.flatMap((point) => [
@@ -2099,6 +2101,37 @@ export default function Home() {
                 >
                   Top-down X/Z · radius ~{mapExtent.toFixed(2)}
                 </div>
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                  gap: 8,
+                  marginTop: 10,
+                  fontSize: 12,
+                }}
+              >
+                {[
+                  ["Visible", cameraPoseData?.visible_landmark_count ?? 0],
+                  ["Persistent", cameraPoseData?.persistent_landmark_count ?? 0],
+                  ["Missing", cameraPoseData?.missing_landmark_count ?? 0],
+                  ["Re-associated", landmarkLifecycle.descriptor_reassociated ?? 0],
+                  ["Pruned", landmarkLifecycle.pruned ?? 0],
+                  ["XFeat", descriptorBackend.status || "n/a"],
+                ].map(([label, value]) => (
+                  <div
+                    key={String(label)}
+                    style={{
+                      background: "#f8fafc",
+                      border: "1px solid #e2e8f0",
+                      borderRadius: 12,
+                      padding: "8px 10px",
+                    }}
+                  >
+                    <div style={{ color: "#64748b", fontWeight: 700 }}>{label}</div>
+                    <div style={{ color: "#0f172a", fontWeight: 800, marginTop: 2 }}>{String(value)}</div>
+                  </div>
+                ))}
               </div>
             </div>
 

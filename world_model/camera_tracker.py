@@ -16,10 +16,12 @@ import sys
 
 MAX_PNP_REPROJECTION_ERROR = 10.0
 MAX_PNP_POSITION_JUMP = 0.75
-MAX_MISSING_FRAMES = 45
-MAX_LANDMARKS = 300
+MAX_MISSING_FRAMES = 180
+MAX_LANDMARKS = 600
 MIN_QUALITY_FOR_PERSISTENCE = 0.2
-XFEAT_TOP_K = 1024
+MIN_HITS_FOR_PERSISTENCE = 2
+XFEAT_TOP_K = 512
+XFEAT_UPDATE_EVERY = 4
 XFEAT_MATCH_RADIUS_PX = 12.0
 MIN_REOBSERVATION_SIMILARITY = 0.78
 MAX_REOBSERVATION_DISTANCE_PX = 90.0
@@ -115,6 +117,7 @@ class XFeatDescriptorBackend:
             "status": self.status,
             "device": self.device,
             "top_k": self.top_k,
+            "update_every": XFEAT_UPDATE_EVERY,
             "last_error": self.last_error,
         }
 
@@ -261,6 +264,9 @@ class CameraTracker:
         y = int(np.clip(round(v), 0, h - 1))
         return float(depth_map[y, x])
 
+    def _should_update_descriptors(self) -> bool:
+        return self.frame_index % XFEAT_UPDATE_EVERY == 0
+
     def _extract_descriptor(self, gray: np.ndarray, u: float, v: float) -> np.ndarray | None:
         return self.descriptor_backend.describe_at(gray, u, v)
 
@@ -315,7 +321,7 @@ class CameraTracker:
             return sum(
                 1 for item in self.landmarks.values()
                 if item.get("status") in {"visible", "missing"}
-                and float(item.get("quality", 0.0)) >= MIN_QUALITY_FOR_PERSISTENCE
+                and int(item.get("hits", 0)) >= MIN_HITS_FOR_PERSISTENCE
             )
         return sum(1 for item in self.landmarks.values() if item.get("status") == status)
 
@@ -348,8 +354,7 @@ class CameraTracker:
         stale_ids = []
         for track_id, landmark in self.landmarks.items():
             missed = int(landmark.get("missed_frames", 0))
-            quality = float(landmark.get("quality", 0.0))
-            if missed > MAX_MISSING_FRAMES or (missed > 8 and quality < MIN_QUALITY_FOR_PERSISTENCE):
+            if missed > MAX_MISSING_FRAMES:
                 stale_ids.append(track_id)
 
         if len(self.landmarks) - len(stale_ids) > MAX_LANDMARKS:
@@ -380,10 +385,19 @@ class CameraTracker:
     def _export_persistent_map(self):
         persistent = [
             self._public_landmark(item) for item in self.landmarks.values()
-            if item.get("status") in {"visible", "missing"} and item.get("quality", 0.0) >= MIN_QUALITY_FOR_PERSISTENCE
+            if item.get("status") in {"visible", "missing"}
+            and int(item.get("hits", 0)) >= MIN_HITS_FOR_PERSISTENCE
         ]
-        persistent.sort(key=lambda item: (item.get("quality", 0.0), item.get("hits", 0), item.get("last_seen", 0)), reverse=True)
-        return persistent[:160]
+        persistent.sort(
+            key=lambda item: (
+                item.get("status") == "visible",
+                item.get("quality", 0.0),
+                item.get("hits", 0),
+                item.get("last_seen", 0),
+            ),
+            reverse=True,
+        )
+        return persistent[:240]
 
     def _lift_pixel(self, u: float, v: float, depth_value: float, intrinsics: dict) -> np.ndarray:
         fx = float(intrinsics["fx"])
@@ -490,7 +504,12 @@ class CameraTracker:
             v = float(pt[1])
             depth_value = self._sample_depth(depth_map, u, v)
             world_point = self._lift_pixel(u, v, depth_value, intrinsics)
-            descriptor = self._extract_descriptor(gray, u, v) if gray is not None else None
+            should_update_descriptor = gray is not None and (
+                track_id not in self.landmarks
+                or self.landmarks[track_id].get("status") == "missing"
+                or self._should_update_descriptors()
+            )
+            descriptor = self._extract_descriptor(gray, u, v) if should_update_descriptor else None
 
             if track_id in self.landmarks:
                 was_missing = self.landmarks[track_id].get("status") == "missing"
@@ -552,7 +571,11 @@ class CameraTracker:
             v = float(pt[1])
             depth_value = self._sample_depth(depth_map, u, v)
             world_point = self._lift_pixel(u, v, depth_value, intrinsics)
-            descriptor = self._extract_descriptor(self.prev_gray, u, v) if self.prev_gray is not None else None
+            should_update_descriptor = (
+                self.prev_gray is not None
+                and self._should_update_descriptors()
+            )
+            descriptor = self._extract_descriptor(self.prev_gray, u, v) if should_update_descriptor else None
             prev = np.array(self.landmarks[track_id]["position_world"], dtype=np.float32)
             world_point = 0.75 * prev + 0.25 * world_point
 
