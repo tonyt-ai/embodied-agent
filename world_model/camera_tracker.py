@@ -25,6 +25,13 @@ XFEAT_UPDATE_EVERY = 4
 XFEAT_MATCH_RADIUS_PX = 12.0
 MIN_REOBSERVATION_SIMILARITY = 0.78
 MAX_REOBSERVATION_DISTANCE_PX = 90.0
+KEYFRAME_MIN_INTERVAL = 12
+KEYFRAME_MIN_TRANSLATION = 0.04
+KEYFRAME_MIN_VISIBLE = 35
+MAX_KEYFRAMES = 20
+MAX_OBSERVATIONS_PER_LANDMARK = 8
+STABLE_MIN_OBSERVATIONS = 2
+STABLE_MAX_REPROJECTION_ERROR = 8.0
 
 
 class XFeatDescriptorBackend:
@@ -137,6 +144,10 @@ class CameraTracker:
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
         self.descriptor_backend = XFeatDescriptorBackend()
+        self.keyframes = []
+        self.next_keyframe_id = 1
+        self.last_keyframe_frame = 0
+        self.last_keyframe_position = None
         self.lifecycle_stats = {
             "created": 0,
             "updated": 0,
@@ -155,6 +166,10 @@ class CameraTracker:
         self.camera_position_world = np.zeros(3, dtype=np.float32)
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
+        self.keyframes = []
+        self.next_keyframe_id = 1
+        self.last_keyframe_frame = 0
+        self.last_keyframe_position = None
         self.lifecycle_stats = {
             "created": 0,
             "updated": 0,
@@ -195,6 +210,10 @@ class CameraTracker:
             "missing_landmark_count": self._count_landmarks("missing"),
             "landmark_lifecycle": dict(self.lifecycle_stats),
             "descriptor_backend": self.descriptor_backend.debug_info(),
+            "keyframes": len(self.keyframes),
+            "stable_landmark_count": self._stable_landmark_count(),
+            "mean_stable_reprojection_error": self._mean_stable_reprojection_error(),
+            "latest_keyframe": self.keyframes[-1] if self.keyframes else None,
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
@@ -313,7 +332,7 @@ class CameraTracker:
         return {
             key: value
             for key, value in landmark.items()
-            if key != "descriptor"
+            if key not in {"descriptor", "observations"}
         }
 
     def _count_landmarks(self, status: str) -> int:
@@ -324,6 +343,16 @@ class CameraTracker:
                 and int(item.get("hits", 0)) >= MIN_HITS_FOR_PERSISTENCE
             )
         return sum(1 for item in self.landmarks.values() if item.get("status") == status)
+
+    def _mean_stable_reprojection_error(self):
+        errors = [
+            float(item["mean_reprojection_error"])
+            for item in self.landmarks.values()
+            if item.get("is_stable") and item.get("mean_reprojection_error") is not None
+        ]
+        if not errors:
+            return None
+        return round(float(np.mean(errors)), 3)
 
     def _landmark_quality(self, hits: int, age: int, missed_frames: int) -> float:
         hit_score = min(1.0, hits / 12.0)
@@ -420,6 +449,119 @@ class CameraTracker:
             ],
             dtype=np.float32,
         )
+
+    def _project_world_point(self, world_point, rotation_cw, camera_position_world, intrinsics) -> np.ndarray | None:
+        world_point = np.asarray(world_point, dtype=np.float32)
+        camera_point = rotation_cw @ (world_point - camera_position_world)
+        if float(camera_point[2]) <= 1e-6:
+            return None
+
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+        u = fx * float(camera_point[0]) / float(camera_point[2]) + cx
+        v = fy * float(camera_point[1]) / float(camera_point[2]) + cy
+        return np.array([u, v], dtype=np.float32)
+
+    def _update_landmark_reprojection_stats(self, track_id):
+        landmark = self.landmarks.get(track_id)
+        if not landmark:
+            return
+        observations = landmark.get("observations", [])
+        if not observations:
+            landmark["observation_count"] = 0
+            landmark["mean_reprojection_error"] = None
+            landmark["is_stable"] = False
+            return
+
+        errors = []
+        world_point = landmark.get("position_world")
+        if not world_point:
+            return
+
+        for obs in observations:
+            projected = self._project_world_point(
+                world_point,
+                np.asarray(obs["rotation_cw"], dtype=np.float32),
+                np.asarray(obs["camera_position_world"], dtype=np.float32),
+                obs["intrinsics"],
+            )
+            if projected is None:
+                continue
+            image_xy = np.asarray(obs["image_xy"], dtype=np.float32)
+            errors.append(float(np.linalg.norm(projected - image_xy)))
+
+        landmark["observation_count"] = len(observations)
+        if errors:
+            mean_error = float(np.mean(errors))
+            landmark["mean_reprojection_error"] = round(mean_error, 3)
+            landmark["is_stable"] = (
+                len(observations) >= STABLE_MIN_OBSERVATIONS
+                and mean_error <= STABLE_MAX_REPROJECTION_ERROR
+            )
+        else:
+            landmark["mean_reprojection_error"] = None
+            landmark["is_stable"] = False
+
+    def _stable_landmark_count(self) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("is_stable"))
+
+    def _should_create_keyframe(self, visible_ids: set[int], pnp_inliers: int, pose_source: str) -> bool:
+        if pose_source != "pnp":
+            return False
+        if len(visible_ids) < KEYFRAME_MIN_VISIBLE or pnp_inliers < KEYFRAME_MIN_VISIBLE:
+            return False
+        if not self.keyframes:
+            return True
+        if self.frame_index - self.last_keyframe_frame < KEYFRAME_MIN_INTERVAL:
+            return False
+        if self.last_keyframe_position is None:
+            return True
+        translation = float(np.linalg.norm(self.camera_position_world - self.last_keyframe_position))
+        return translation >= KEYFRAME_MIN_TRANSLATION
+
+    def _maybe_add_keyframe(self, visible_ids: set[int], pnp_inliers: int, pose_source: str, intrinsics):
+        if intrinsics is None or not self._should_create_keyframe(visible_ids, pnp_inliers, pose_source):
+            return
+
+        rotation_cw = self.rotation_wc.T.astype(np.float32)
+        keyframe = {
+            "id": self.next_keyframe_id,
+            "frame_index": self.frame_index,
+            "camera_position_world": np.round(self.camera_position_world, 4).tolist(),
+            "rotation_cw": np.round(rotation_cw, 6).tolist(),
+            "visible_landmarks": len(visible_ids),
+        }
+        self.next_keyframe_id += 1
+        self.keyframes.append(keyframe)
+        self.keyframes = self.keyframes[-MAX_KEYFRAMES:]
+        self.last_keyframe_frame = self.frame_index
+        self.last_keyframe_position = self.camera_position_world.copy()
+
+        intrinsics_snapshot = {
+            "fx": float(intrinsics["fx"]),
+            "fy": float(intrinsics["fy"]),
+            "cx": float(intrinsics["cx"]),
+            "cy": float(intrinsics["cy"]),
+        }
+
+        for track_id in visible_ids:
+            landmark = self.landmarks.get(track_id)
+            if not landmark:
+                continue
+            observation = {
+                "keyframe_id": keyframe["id"],
+                "frame_index": self.frame_index,
+                "image_xy": landmark.get("image_xy", [0.0, 0.0]),
+                "camera_position_world": keyframe["camera_position_world"],
+                "rotation_cw": keyframe["rotation_cw"],
+                "intrinsics": intrinsics_snapshot,
+            }
+            observations = landmark.setdefault("observations", [])
+            observations.append(observation)
+            landmark["observations"] = observations[-MAX_OBSERVATIONS_PER_LANDMARK:]
+            self._update_landmark_reprojection_stats(track_id)
 
     def _estimate_pose_from_anchors(self, points, track_ids, intrinsics):
         if intrinsics is None or points is None or len(points) < 6:
@@ -713,6 +855,12 @@ class CameraTracker:
         delta = self.camera_position_world - prev_camera_position
 
         sparse_map = self._update_landmarks(good_new, good_ids, depth_map, intrinsics, gray=gray)
+        visible_ids = {
+            int(track_id)
+            for track_id in good_ids
+            if track_id in self.landmarks and self.landmarks[track_id].get("status") == "visible"
+        }
+        self._maybe_add_keyframe(visible_ids, pnp_inliers, pose_source, intrinsics)
 
         self.prev_gray = gray
         self.prev_points = good_new.reshape(-1, 1, 2).astype(np.float32) if len(good_new) else None

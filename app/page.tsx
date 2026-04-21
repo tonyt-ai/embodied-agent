@@ -2115,6 +2115,8 @@ export default function Home() {
                   ["Visible", cameraPoseData?.visible_landmark_count ?? 0],
                   ["Persistent", cameraPoseData?.persistent_landmark_count ?? 0],
                   ["Missing", cameraPoseData?.missing_landmark_count ?? 0],
+                  ["Stable", cameraPoseData?.stable_landmark_count ?? 0],
+                  ["Keyframes", cameraPoseData?.keyframes ?? 0],
                   ["Re-associated", landmarkLifecycle.descriptor_reassociated ?? 0],
                   ["Pruned", landmarkLifecycle.pruned ?? 0],
                   ["XFeat", descriptorBackend.status || "n/a"],
