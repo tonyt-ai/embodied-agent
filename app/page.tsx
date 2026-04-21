@@ -256,6 +256,7 @@ export default function Home() {
         quality: Number(point?.quality ?? 0),
         hits: Number(point?.hits ?? 0),
         status: point?.status || "visible",
+        isLocal: Boolean(point?.is_local_map),
       };
     })
     .filter(Boolean) as Array<{
@@ -266,6 +267,7 @@ export default function Home() {
       quality: number;
       hits: number;
       status: string;
+      isLocal: boolean;
     }>;
   const cameraMapX = Number(cameraPositionWorld[0] || 0);
   const cameraMapZ = Number(cameraPositionWorld[2] || 0);
@@ -2063,7 +2065,7 @@ export default function Home() {
 
                   const isMissing = point.status === "missing";
                   const size = Math.max(3, Math.min(8, 3 + point.hits * 0.25));
-                  const color = isMissing ? "#64748b" : point.quality > 0.6 ? "#22c55e" : "#38bdf8";
+                  const color = isMissing ? "#64748b" : point.isLocal ? "#facc15" : point.quality > 0.6 ? "#22c55e" : "#38bdf8";
 
                   return (
                     <div
@@ -2078,7 +2080,7 @@ export default function Home() {
                         transform: "translate(-50%, -50%)",
                         background: color,
                         opacity: isMissing ? 0.45 : 0.9,
-                        border: "1px solid rgba(255,255,255,0.6)",
+                        border: point.isLocal ? "2px solid rgba(254,240,138,0.95)" : "1px solid rgba(255,255,255,0.6)",
                         pointerEvents: "none",
                       }}
                       title={`Landmark ${point.id}: x=${point.x.toFixed(3)}, y=${point.y.toFixed(3)}, z=${point.z.toFixed(3)}, q=${point.quality.toFixed(2)}, ${point.status}`}
@@ -2117,6 +2119,9 @@ export default function Home() {
                   ["Missing", cameraPoseData?.missing_landmark_count ?? 0],
                   ["Stable", cameraPoseData?.stable_landmark_count ?? 0],
                   ["Keyframes", cameraPoseData?.keyframes ?? 0],
+                  ["Local map", cameraPoseData?.local_landmark_count ?? 0],
+                  ["Covis edges", cameraPoseData?.covisibility_edges ?? 0],
+                  ["BA refined", cameraPoseData?.ba_lite?.landmarks_refined ?? 0],
                   ["Re-associated", landmarkLifecycle.descriptor_reassociated ?? 0],
                   ["Pruned", landmarkLifecycle.pruned ?? 0],
                   ["XFeat", descriptorBackend.status || "n/a"],

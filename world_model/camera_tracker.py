@@ -32,6 +32,13 @@ MAX_KEYFRAMES = 20
 MAX_OBSERVATIONS_PER_LANDMARK = 8
 STABLE_MIN_OBSERVATIONS = 2
 STABLE_MAX_REPROJECTION_ERROR = 8.0
+BA_LITE_MIN_OBSERVATIONS = 2
+BA_LITE_MAX_INITIAL_ERROR = 25.0
+BA_LITE_BLEND = 0.35
+BA_LITE_MAX_UPDATES_PER_KEYFRAME = 80
+COVISIBILITY_MIN_SHARED = 8
+LOCAL_MAP_MAX_KEYFRAMES = 5
+LOCAL_MAP_MAX_LANDMARKS = 180
 
 
 class XFeatDescriptorBackend:
@@ -148,6 +155,16 @@ class CameraTracker:
         self.next_keyframe_id = 1
         self.last_keyframe_frame = 0
         self.last_keyframe_position = None
+        self.covisibility_graph = {}
+        self.local_keyframe_ids = []
+        self.local_landmark_ids = set()
+        self.ba_lite_stats = {
+            "runs": 0,
+            "landmarks_refined": 0,
+            "last_refined": 0,
+            "last_mean_error_before": None,
+            "last_mean_error_after": None,
+        }
         self.lifecycle_stats = {
             "created": 0,
             "updated": 0,
@@ -170,6 +187,16 @@ class CameraTracker:
         self.next_keyframe_id = 1
         self.last_keyframe_frame = 0
         self.last_keyframe_position = None
+        self.covisibility_graph = {}
+        self.local_keyframe_ids = []
+        self.local_landmark_ids = set()
+        self.ba_lite_stats = {
+            "runs": 0,
+            "landmarks_refined": 0,
+            "last_refined": 0,
+            "last_mean_error_before": None,
+            "last_mean_error_after": None,
+        }
         self.lifecycle_stats = {
             "created": 0,
             "updated": 0,
@@ -214,6 +241,11 @@ class CameraTracker:
             "stable_landmark_count": self._stable_landmark_count(),
             "mean_stable_reprojection_error": self._mean_stable_reprojection_error(),
             "latest_keyframe": self.keyframes[-1] if self.keyframes else None,
+            "covisibility_edges": self._covisibility_edge_count(),
+            "latest_covisible_keyframes": self._latest_covisible_keyframes(),
+            "local_keyframes": list(self.local_keyframe_ids),
+            "local_landmark_count": len(self.local_landmark_ids),
+            "ba_lite": dict(self.ba_lite_stats),
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
@@ -335,6 +367,91 @@ class CameraTracker:
             if key not in {"descriptor", "observations"}
         }
 
+    def _covisibility_edge_count(self) -> int:
+        return sum(len(neighbors) for neighbors in self.covisibility_graph.values()) // 2
+
+    def _latest_covisible_keyframes(self):
+        if not self.keyframes:
+            return []
+        latest_id = int(self.keyframes[-1]["id"])
+        neighbors = self.covisibility_graph.get(latest_id, {})
+        return [
+            {"id": int(keyframe_id), "shared_landmarks": int(shared)}
+            for keyframe_id, shared in sorted(neighbors.items(), key=lambda item: item[1], reverse=True)[:8]
+        ]
+
+    def _rebuild_covisibility_graph(self):
+        live_keyframe_ids = {int(item["id"]) for item in self.keyframes}
+        pair_counts = {}
+
+        for landmark in self.landmarks.values():
+            observations = landmark.get("observations", [])
+            if len(observations) < 2:
+                continue
+
+            keyframe_ids = sorted(
+                {
+                    int(obs["keyframe_id"])
+                    for obs in observations
+                    if int(obs.get("keyframe_id", -1)) in live_keyframe_ids
+                }
+            )
+            for idx, keyframe_id in enumerate(keyframe_ids):
+                for other_id in keyframe_ids[idx + 1:]:
+                    pair = (keyframe_id, other_id)
+                    pair_counts[pair] = pair_counts.get(pair, 0) + 1
+
+        graph = {keyframe_id: {} for keyframe_id in live_keyframe_ids}
+        for (left_id, right_id), shared in pair_counts.items():
+            if shared < COVISIBILITY_MIN_SHARED:
+                continue
+            graph.setdefault(left_id, {})[right_id] = shared
+            graph.setdefault(right_id, {})[left_id] = shared
+        self.covisibility_graph = graph
+
+    def _select_local_map(self, latest_keyframe_id: int):
+        neighbors = self.covisibility_graph.get(latest_keyframe_id, {})
+        local_keyframes = [latest_keyframe_id]
+        local_keyframes.extend(
+            keyframe_id
+            for keyframe_id, _ in sorted(neighbors.items(), key=lambda item: item[1], reverse=True)[
+                : LOCAL_MAP_MAX_KEYFRAMES - 1
+            ]
+        )
+        local_keyframe_set = set(local_keyframes)
+
+        scored_landmarks = []
+        for track_id, landmark in self.landmarks.items():
+            observations = landmark.get("observations", [])
+            if not observations or int(landmark.get("hits", 0)) < MIN_HITS_FOR_PERSISTENCE:
+                continue
+
+            observed_keyframes = {
+                int(obs["keyframe_id"])
+                for obs in observations
+                if int(obs.get("keyframe_id", -1)) in local_keyframe_set
+            }
+            if not observed_keyframes:
+                continue
+
+            score = (
+                len(observed_keyframes),
+                int(bool(landmark.get("is_stable"))),
+                float(landmark.get("quality", 0.0)),
+                int(landmark.get("hits", 0)),
+                int(landmark.get("last_seen", 0)),
+            )
+            scored_landmarks.append((score, track_id))
+
+        scored_landmarks.sort(reverse=True)
+        self.local_keyframe_ids = local_keyframes
+        self.local_landmark_ids = {
+            track_id for _, track_id in scored_landmarks[:LOCAL_MAP_MAX_LANDMARKS]
+        }
+
+        for track_id, landmark in self.landmarks.items():
+            landmark["is_local_map"] = track_id in self.local_landmark_ids
+
     def _count_landmarks(self, status: str) -> int:
         if status == "persistent":
             return sum(
@@ -402,6 +519,8 @@ class CameraTracker:
             if track_id in self.landmarks:
                 del self.landmarks[track_id]
                 self.lifecycle_stats["pruned"] += 1
+        if stale_ids:
+            self.local_landmark_ids.difference_update(stale_ids)
 
     def _export_visible_map(self):
         visible = [
@@ -419,6 +538,8 @@ class CameraTracker:
         ]
         persistent.sort(
             key=lambda item: (
+                item.get("is_local_map", False),
+                item.get("is_stable", False),
                 item.get("status") == "visible",
                 item.get("quality", 0.0),
                 item.get("hits", 0),
@@ -463,6 +584,116 @@ class CameraTracker:
         u = fx * float(camera_point[0]) / float(camera_point[2]) + cx
         v = fy * float(camera_point[1]) / float(camera_point[2]) + cy
         return np.array([u, v], dtype=np.float32)
+
+    def _ray_from_observation(self, observation):
+        intrinsics = observation["intrinsics"]
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+        u, v = observation["image_xy"]
+        ray_camera = np.array(
+            [
+                (float(u) - cx) / max(fx, 1e-6),
+                (float(v) - cy) / max(fy, 1e-6),
+                1.0,
+            ],
+            dtype=np.float32,
+        )
+        ray_camera = ray_camera / max(float(np.linalg.norm(ray_camera)), 1e-6)
+        rotation_cw = np.asarray(observation["rotation_cw"], dtype=np.float32)
+        rotation_wc = rotation_cw.T
+        origin = np.asarray(observation["camera_position_world"], dtype=np.float32)
+        direction = rotation_wc @ ray_camera
+        direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
+        return origin, direction
+
+    def _triangulate_from_observations(self, observations):
+        if len(observations) < 2:
+            return None
+
+        lhs = np.zeros((3, 3), dtype=np.float32)
+        rhs = np.zeros(3, dtype=np.float32)
+        eye = np.eye(3, dtype=np.float32)
+        for observation in observations:
+            origin, direction = self._ray_from_observation(observation)
+            projector = eye - np.outer(direction, direction).astype(np.float32)
+            lhs += projector
+            rhs += projector @ origin
+
+        try:
+            point = np.linalg.solve(lhs + 1e-4 * eye, rhs)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(point)):
+            return None
+        return point.astype(np.float32)
+
+    def _mean_reprojection_error_for_point(self, world_point, observations):
+        errors = []
+        for obs in observations:
+            projected = self._project_world_point(
+                world_point,
+                np.asarray(obs["rotation_cw"], dtype=np.float32),
+                np.asarray(obs["camera_position_world"], dtype=np.float32),
+                obs["intrinsics"],
+            )
+            if projected is None:
+                continue
+            image_xy = np.asarray(obs["image_xy"], dtype=np.float32)
+            errors.append(float(np.linalg.norm(projected - image_xy)))
+        if not errors:
+            return None
+        return float(np.mean(errors))
+
+    def _run_ba_lite(self, candidate_ids):
+        before_errors = []
+        after_errors = []
+        refined = 0
+
+        for track_id in list(candidate_ids)[:BA_LITE_MAX_UPDATES_PER_KEYFRAME]:
+            landmark = self.landmarks.get(track_id)
+            if not landmark:
+                continue
+            observations = landmark.get("observations", [])
+            if len(observations) < BA_LITE_MIN_OBSERVATIONS:
+                continue
+
+            current_point = np.asarray(landmark.get("position_world", [0.0, 0.0, 0.0]), dtype=np.float32)
+            before_error = self._mean_reprojection_error_for_point(current_point, observations)
+            if before_error is None or before_error > BA_LITE_MAX_INITIAL_ERROR:
+                self._update_landmark_reprojection_stats(track_id)
+                continue
+
+            triangulated = self._triangulate_from_observations(observations)
+            if triangulated is None:
+                self._update_landmark_reprojection_stats(track_id)
+                continue
+
+            candidate = (1.0 - BA_LITE_BLEND) * current_point + BA_LITE_BLEND * triangulated
+            after_error = self._mean_reprojection_error_for_point(candidate, observations)
+            if after_error is None or after_error > before_error:
+                self._update_landmark_reprojection_stats(track_id)
+                continue
+
+            landmark["position_world"] = np.round(candidate, 4).tolist()
+            landmark["ba_lite_refined"] = True
+            landmark["ba_lite_error_before"] = round(before_error, 3)
+            landmark["ba_lite_error_after"] = round(after_error, 3)
+            self._update_landmark_reprojection_stats(track_id)
+            before_errors.append(before_error)
+            after_errors.append(after_error)
+            refined += 1
+
+        self.ba_lite_stats["runs"] += 1
+        self.ba_lite_stats["last_refined"] = refined
+        self.ba_lite_stats["landmarks_refined"] += refined
+        self.ba_lite_stats["last_mean_error_before"] = (
+            round(float(np.mean(before_errors)), 3) if before_errors else None
+        )
+        self.ba_lite_stats["last_mean_error_after"] = (
+            round(float(np.mean(after_errors)), 3) if after_errors else None
+        )
 
     def _update_landmark_reprojection_stats(self, track_id):
         landmark = self.landmarks.get(track_id)
@@ -562,6 +793,10 @@ class CameraTracker:
             observations.append(observation)
             landmark["observations"] = observations[-MAX_OBSERVATIONS_PER_LANDMARK:]
             self._update_landmark_reprojection_stats(track_id)
+
+        self._rebuild_covisibility_graph()
+        self._select_local_map(keyframe["id"])
+        self._run_ba_lite(self.local_landmark_ids or visible_ids)
 
     def _estimate_pose_from_anchors(self, points, track_ids, intrinsics):
         if intrinsics is None or points is None or len(points) < 6:
