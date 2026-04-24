@@ -2,21 +2,63 @@
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Tuple
 
 import numpy as np
 
 
 def infer_camera_intrinsics(width: int, height: int) -> dict:
-    """Infer a simple pinhole camera model from image dimensions."""
-    focal = float(max(width, height))
+    """Infer or load a simple pinhole camera model from image dimensions.
+
+    Env overrides are intentionally lightweight for webcam calibration:
+    CAMERA_FX/CAMERA_FY/CAMERA_CX/CAMERA_CY win over CAMERA_FOV_DEG.
+    """
+    fx_env = os.environ.get("CAMERA_FX")
+    fy_env = os.environ.get("CAMERA_FY")
+    cx_env = os.environ.get("CAMERA_CX")
+    cy_env = os.environ.get("CAMERA_CY")
+    fov_env = os.environ.get("CAMERA_FOV_DEG")
+
+    source = "default-c920-fov"
+    fov_deg = 70.42
+    if fov_env:
+        try:
+            fov_deg = float(fov_env)
+            source = "env-fov"
+        except ValueError:
+            fov_deg = 70.42
+
+    focal = float((width * 0.5) / max(math.tan(math.radians(fov_deg) * 0.5), 1e-6))
+    fx = focal
+    fy = focal
+    cx = width / 2.0
+    cy = height / 2.0
+
+    if fx_env or fy_env or cx_env or cy_env:
+        source = "env-intrinsics"
+        try:
+            fx = float(fx_env) if fx_env else fx
+            fy = float(fy_env) if fy_env else fy
+            cx = float(cx_env) if cx_env else cx
+            cy = float(cy_env) if cy_env else cy
+        except ValueError:
+            source = "default-c920-fov"
+            fx = focal
+            fy = focal
+            cx = width / 2.0
+            cy = height / 2.0
+
     return {
-        "fx": focal,
-        "fy": focal,
-        "cx": width / 2.0,
-        "cy": height / 2.0,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
         "width": width,
         "height": height,
+        "source": source,
+        "fov_deg": fov_deg,
     }
 
 

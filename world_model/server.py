@@ -20,7 +20,6 @@ import time
 import torch
 import websockets
 
-from camera_tracker import CameraTracker
 from depth import (
     DEPTH_MAX_RANGE,
     DEPTH_MIN_RANGE,
@@ -32,6 +31,7 @@ from dino_encoder import encode_bbox
 from lift_to_3d import infer_camera_intrinsics, lift_bbox_to_3d
 from pathlib import Path
 from planner import simulate_all_actions
+from slam_backend import create_slam_backend
 from ultralytics import YOLO
 from world_state import WorldState
 
@@ -69,7 +69,19 @@ dino_frame_counter = 0
 prev_state_vec = None
 prev_move_vec = None
 state = WorldState(collection_mode=COLLECT_TRANSITIONS)
-camera_tracker = CameraTracker()
+slam_backend = create_slam_backend()
+
+
+def reset_runtime_state():
+    """Reset transient world-model state between repeatable debug runs."""
+    global state, prev_state_vec, prev_move_vec, last_dino_embedding, dino_frame_counter
+
+    state = WorldState(collection_mode=COLLECT_TRANSITIONS)
+    slam_backend.reset()
+    prev_state_vec = None
+    prev_move_vec = None
+    last_dino_embedding = [0.0] * DINO_DIM
+    dino_frame_counter = 0
 
 
 def save_transition(state_vec, action_vec, next_state_vec):
@@ -308,6 +320,10 @@ def answer_query(query):
         result = simulate_all_actions(state)
         return {"type": "query_result", "result": result}
 
+    if qtype == "reset_world_model":
+        reset_runtime_state()
+        return {"type": "query_result", "result": {"ok": True, "message": "world model reset"}}
+
     return {
         "type": "query_result",
         "result": {
@@ -333,10 +349,10 @@ async def handler(websocket):
             raw_depth_map = estimate_depth(frame)
             t_depth = time.perf_counter()
             intrinsics = infer_camera_intrinsics(frame.shape[1], frame.shape[0])
-            camera_pose = camera_tracker.update(frame, depth_map=raw_depth_map, intrinsics=intrinsics)
+            camera_pose = slam_backend.update(frame, depth_map=raw_depth_map, intrinsics=intrinsics)
             t_pose = time.perf_counter()
             depth_map, depth_stabilization = stabilize_depth_with_anchors(raw_depth_map, camera_pose)
-            camera_pose = camera_tracker.refine_visible_landmarks(depth_map, intrinsics, camera_pose)
+            camera_pose = slam_backend.refine_visible_landmarks(depth_map, intrinsics, camera_pose)
             objects = enrich_detections_with_3d(objects, depth_map, camera_pose, intrinsics)
             depth_debug = encode_depth_debug(depth_map)
             t_world = time.perf_counter()
@@ -349,6 +365,8 @@ async def handler(websocket):
                     "fy": round(float(intrinsics["fy"]), 2),
                     "cx": round(float(intrinsics["cx"]), 2),
                     "cy": round(float(intrinsics["cy"]), 2),
+                    "source": intrinsics.get("source", "unknown"),
+                    "fov_deg": round(float(intrinsics.get("fov_deg", 0.0)), 2),
                 },
                 "num_objects": len(objects),
                 "active_tracks": camera_pose.get("active_tracks", 0),
@@ -360,15 +378,23 @@ async def handler(websocket):
                 "landmark_lifecycle": camera_pose.get("landmark_lifecycle", {}),
                 "keyframes": camera_pose.get("keyframes", 0),
                 "stable_landmark_count": camera_pose.get("stable_landmark_count", 0),
+                "stable_2d_landmark_count": camera_pose.get("stable_2d_landmark_count", 0),
+                "geometry_verified_landmark_count": camera_pose.get("geometry_verified_landmark_count", 0),
+                "triangulated_landmark_count": camera_pose.get("triangulated_landmark_count", 0),
+                "triangulation": camera_pose.get("triangulation", {}),
                 "mean_stable_reprojection_error": camera_pose.get("mean_stable_reprojection_error"),
                 "latest_keyframe": camera_pose.get("latest_keyframe"),
                 "covisibility_edges": camera_pose.get("covisibility_edges", 0),
                 "latest_covisible_keyframes": camera_pose.get("latest_covisible_keyframes", []),
                 "local_keyframes": camera_pose.get("local_keyframes", []),
                 "local_landmark_count": camera_pose.get("local_landmark_count", 0),
+                "geometric_inlier_count": camera_pose.get("geometric_inlier_count", 0),
                 "pnp_anchor_scope": camera_pose.get("pnp_anchor_scope", "none"),
+                "local_keyframe_baseline": camera_pose.get("local_keyframe_baseline", 0.0),
                 "ba_lite": camera_pose.get("ba_lite", {}),
+                "sliding_ba": camera_pose.get("sliding_ba", {}),
                 "pose_source": camera_pose.get("pose_source", "unknown"),
+                "slam_backend": camera_pose.get("slam_backend", "unknown"),
                 "pnp_inliers": camera_pose.get("pnp_inliers", 0),
                 "pnp_reprojection_error": camera_pose.get("pnp_reprojection_error"),
                 "camera_position_world": camera_pose.get("camera_position_world"),

@@ -66,6 +66,7 @@ function randomEventId() {
 
 type CaptureMode = "social" | "embodied";
 type AvatarMode = "ai" | "direct";
+type EmbodiedVideoSource = "scene" | "camera";
 
 type ButtonTone = "primary" | "secondary" | "danger";
 
@@ -170,6 +171,7 @@ export default function Home() {
 
   const [captureMode, setCaptureMode] = useState<CaptureMode>("embodied");
   const [avatarMode, setAvatarMode] = useState<AvatarMode>("ai");
+  const [embodiedVideoSource, setEmbodiedVideoSource] = useState<EmbodiedVideoSource>("scene");
   const [status, setStatus] = useState("idle");
   const [avatarConnected, setAvatarConnected] = useState(false);
   const [bridgeConnected, setBridgeConnected] = useState(false);
@@ -195,6 +197,7 @@ export default function Home() {
     width: number;
     height: number;
   } | null>(null);
+  const lastDebugTextUpdateRef = useRef<number>(0);
 
   const [worldStateText, setWorldStateText] = useState("");
   const [eventLog, setEventLog] = useState("");
@@ -270,9 +273,11 @@ export default function Home() {
       isLocal: boolean;
     }>;
   const cameraMapX = Number(cameraPositionWorld[0] || 0);
+  const cameraMapY = Number(cameraPositionWorld[1] || 0);
   const cameraMapZ = Number(cameraPositionWorld[2] || 0);
   const landmarkLifecycle = cameraPoseData?.landmark_lifecycle || {};
   const descriptorBackend = cameraPoseData?.descriptor_backend || {};
+  const featureBackend = cameraPoseData?.feature_backend || {};
   const mapExtent = Math.max(
     0.25,
     ...mapPoints3d.flatMap((point) => [
@@ -281,6 +286,44 @@ export default function Home() {
     ]),
   );
   const mapScale = 44 / mapExtent;
+  const sideMapExtent = Math.max(
+    0.25,
+    ...mapPoints3d.flatMap((point) => [
+      Math.abs(point.z - cameraMapZ),
+      Math.abs(point.y - cameraMapY),
+    ]),
+  );
+  const sideMapScale = 44 / sideMapExtent;
+  const pointXs = mapPoints3d.map((point) => point.x);
+  const pointYs = mapPoints3d.map((point) => point.y);
+  const pointZs = mapPoints3d.map((point) => point.z);
+  const axisRange = (values: number[]) => (
+    values.length > 0 ? Math.max(...values) - Math.min(...values) : 0
+  );
+  const mapRangeX = axisRange(pointXs);
+  const mapRangeY = axisRange(pointYs);
+  const mapRangeZ = axisRange(pointZs);
+  const sideYExaggeration = mapRangeY > 0 && mapRangeY < mapRangeZ * 0.35 ? 3 : 1;
+  const mapHealthNotes = [
+    (cameraPoseData?.geometry_verified_landmark_count ?? 0) < 15
+      ? "Few geometry-verified landmarks: 3D anchors are still noisy."
+      : null,
+    (cameraPoseData?.covisibility_edges ?? 0) < 3 && (cameraPoseData?.keyframes ?? 0) > 4
+      ? "Weak covisibility graph: views are not sharing enough persistent points."
+      : null,
+    (landmarkLifecycle.pruned ?? 0) > Math.max(500, (landmarkLifecycle.reassociated ?? landmarkLifecycle.descriptor_reassociated ?? 0) * 8)
+      ? "High landmark churn: features are being created and pruned faster than they reconnect."
+      : null,
+    (cameraPoseData?.local_visible_landmark_count ?? 0) < 12 && cameraPoseData?.pnp_anchor_scope === "local-map"
+      ? "Local PnP has thin support: pose may work but remain fragile."
+      : null,
+    (cameraPoseData?.local_keyframe_baseline ?? 0) < 0.03 && (cameraPoseData?.keyframes ?? 0) > 2
+      ? "Low local baseline: 3D triangulation has too little parallax."
+      : null,
+    mapRangeY > 0 && mapRangeY < mapRangeZ * 0.2
+      ? "Flat side view: vertical spread is much smaller than depth spread."
+      : null,
+  ].filter(Boolean) as string[];
 
   const socialState = {
     inputTranscript,
@@ -649,6 +692,7 @@ export default function Home() {
     const ws = new WebSocket("ws://localhost:8090");
 
     ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "query", query: "reset_world_model" }));
       setEventLog((prev) =>
         [`[WORLD MODEL CONNECTED]`, prev].filter(Boolean).join("\n\n").slice(0, 4000)
       );
@@ -667,11 +711,18 @@ export default function Home() {
           const hands = msg.hands || [];
           const worldDebug = msg.world_debug || {};
           const depthDebug = msg.depth_debug || null;
+          const now = performance.now();
           setObservedObjects(objects);
           setWorldStateText(JSON.stringify({ objects }, null, 2));
-          setCameraPoseText(JSON.stringify(cameraPose, null, 2));
-          setObjects3dText(JSON.stringify(objects3d, null, 2));
-          setSparseMapText(JSON.stringify(sparseMap, null, 2));
+          const shouldUpdateDebugText = now - lastDebugTextUpdateRef.current > 500;
+          if (shouldUpdateDebugText) {
+            setCameraPoseText(JSON.stringify(cameraPose, null, 2));
+            setObjects3dText(JSON.stringify(objects3d, null, 2));
+            setSparseMapText(JSON.stringify(sparseMap, null, 2));
+            setWorldDebugText(JSON.stringify(worldDebug, null, 2));
+            setHandsText(JSON.stringify(hands, null, 2));
+            lastDebugTextUpdateRef.current = now;
+          }
           setSparseMapData(Array.isArray(sparseMap) ? sparseMap : []);
           if (
             pendingWorldFrameRef.current &&
@@ -686,8 +737,6 @@ export default function Home() {
             });
             pendingWorldFrameRef.current = null;
           }
-          setHandsText(JSON.stringify(hands, null, 2));
-          setWorldDebugText(JSON.stringify(worldDebug, null, 2));
           setDepthDebugUrl(depthDebug?.image ? `data:${depthDebug.mime_type};base64,${depthDebug.image}` : "");
           if (depthDebug?.width && depthDebug?.height) {
             setDepthDebugSize({ width: depthDebug.width, height: depthDebug.height });
@@ -953,6 +1002,8 @@ export default function Home() {
 
   async function switchCamera(deviceId: string) {
     try {
+      setEmbodiedVideoSource("camera");
+
       // Stop frame sending first.
       if (frameIntervalRef.current) {
         clearInterval(frameIntervalRef.current);
@@ -996,7 +1047,37 @@ export default function Home() {
     }
   }
 
-  async function startLocalCamera() {
+  async function startSceneVideo() {
+    if (localCamStreamRef.current) {
+      localCamStreamRef.current.getTracks().forEach((t) => t.stop());
+      localCamStreamRef.current = null;
+    }
+
+    if (localCamRef.current) {
+      localCamRef.current.pause();
+      localCamRef.current.srcObject = null;
+      localCamRef.current.src = "/scene.mp4";
+      localCamRef.current.loop = false;
+      localCamRef.current.muted = true;
+      localCamRef.current.playsInline = true;
+      localCamRef.current.onended = async () => {
+        worldModelWsRef.current?.send(JSON.stringify({ type: "query", query: "reset_world_model" }));
+        if (localCamRef.current) {
+          localCamRef.current.currentTime = 0;
+          await localCamRef.current.play();
+        }
+      };
+      localCamRef.current.currentTime = 0;
+      await localCamRef.current.play();
+    }
+  }
+
+  async function startLocalCamera(sourceOverride: EmbodiedVideoSource = embodiedVideoSource) {
+    if (isEmbodiedMode && sourceOverride === "scene") {
+      await startSceneVideo();
+      return;
+    }
+
     // First call to unlock labels
     const initialStream = await navigator.mediaDevices.getUserMedia({
       video: true,
@@ -1020,8 +1101,30 @@ export default function Home() {
     localCamStreamRef.current = stream;
 
     if (localCamRef.current) {
+      localCamRef.current.pause();
+      localCamRef.current.removeAttribute("src");
+      localCamRef.current.loop = false;
+      localCamRef.current.onended = null;
       localCamRef.current.srcObject = stream;
       await localCamRef.current.play();
+    }
+  }
+
+  async function switchEmbodiedVideoSource(source: EmbodiedVideoSource) {
+    setEmbodiedVideoSource(source);
+    if (!isEmbodiedMode) return;
+
+    const shouldRestart =
+      !!worldModelWsRef.current ||
+      !!localCamStreamRef.current ||
+      Boolean(localCamRef.current?.src);
+
+    if (!shouldRestart) return;
+
+    stopLocalCamera();
+    await startLocalCamera(source);
+    if (worldModelWsRef.current?.readyState === WebSocket.OPEN) {
+      startSendingFrames();
     }
   }
 
@@ -1107,6 +1210,15 @@ export default function Home() {
 
     localCamStreamRef.current?.getTracks().forEach((t) => t.stop());
     localCamStreamRef.current = null;
+
+    if (localCamRef.current) {
+      localCamRef.current.pause();
+      localCamRef.current.srcObject = null;
+      localCamRef.current.removeAttribute("src");
+      localCamRef.current.loop = false;
+      localCamRef.current.onended = null;
+      localCamRef.current.load();
+    }
   }
 
   function stopAllConnections() {
@@ -1217,12 +1329,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!selectedCameraId) return;
+    if (isEmbodiedMode && embodiedVideoSource === "scene") return;
 
     if (localCamStreamRef.current) {
       stopLocalCamera();
       startLocalCamera();
     }
-  }, [selectedCameraId]);
+  }, [selectedCameraId, embodiedVideoSource, isEmbodiedMode]);
 
   useEffect(() => {
     return () => {
@@ -1507,21 +1620,66 @@ export default function Home() {
                   ) : null}
                 </div>
                 <div style={{ marginBottom: 12 }}>
-                  <label style={{ marginRight: 8 }}>{isEmbodiedMode ? "Egocentric camera:" : "Social webcam:"}</label>
-                  <select
-                    value={selectedCameraId || ""}
-                    onChange={async (e) => {
-                      const id = e.target.value;
-                      setSelectedCameraId(id);
-                      await switchCamera(id);
-                    }}
-                  >
-                    {videoDevices.map((cam, i) => (
-                      <option key={cam.deviceId} value={cam.deviceId}>
-                        {cam.label || `Camera ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
+                  {isEmbodiedMode ? (
+                    <>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                        <span style={{ color: "#64748b", fontWeight: 700, fontSize: 13 }}>Embodied input:</span>
+                        <button
+                          onClick={() => switchEmbodiedVideoSource("scene")}
+                          style={toggleChipStyle(embodiedVideoSource === "scene")}
+                        >
+                          scene.mp4
+                        </button>
+                        <button
+                          onClick={() => switchEmbodiedVideoSource("camera")}
+                          style={toggleChipStyle(embodiedVideoSource === "camera")}
+                        >
+                          Live camera
+                        </button>
+                      </div>
+                      {embodiedVideoSource === "camera" ? (
+                        <div>
+                          <label style={{ marginRight: 8 }}>Egocentric camera:</label>
+                          <select
+                            value={selectedCameraId || ""}
+                            onChange={async (e) => {
+                              const id = e.target.value;
+                              setSelectedCameraId(id);
+                              await switchCamera(id);
+                            }}
+                          >
+                            {videoDevices.map((cam, i) => (
+                              <option key={cam.deviceId} value={cam.deviceId}>
+                                {cam.label || `Camera ${i + 1}`}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : (
+                        <div style={{ color: "#64748b", fontSize: 13, fontWeight: 700 }}>
+                          Using /scene.mp4 from public.
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <label style={{ marginRight: 8 }}>Social webcam:</label>
+                      <select
+                        value={selectedCameraId || ""}
+                        onChange={async (e) => {
+                          const id = e.target.value;
+                          setSelectedCameraId(id);
+                          await switchCamera(id);
+                        }}
+                      >
+                        {videoDevices.map((cam, i) => (
+                          <option key={cam.deviceId} value={cam.deviceId}>
+                            {cam.label || `Camera ${i + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -2106,6 +2264,117 @@ export default function Home() {
               </div>
               <div
                 style={{
+                  position: "relative",
+                  height: 190,
+                  overflow: "hidden",
+                  borderRadius: 14,
+                  border: "1px solid #1e293b",
+                  background:
+                    "radial-gradient(circle at 50% 50%, rgba(250,204,21,0.14), transparent 35%), linear-gradient(180deg, #020617 0%, #111827 100%)",
+                  marginTop: 10,
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    backgroundImage:
+                      "linear-gradient(rgba(148,163,184,0.12) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.12) 1px, transparent 1px)",
+                    backgroundSize: "24px 24px",
+                  }}
+                />
+                <div
+                  style={{
+                    position: "absolute",
+                    left: "50%",
+                    top: "50%",
+                    width: 12,
+                    height: 12,
+                    borderRadius: "50%",
+                    transform: "translate(-50%, -50%)",
+                    background: "#f97316",
+                    border: "2px solid #ffedd5",
+                    boxShadow: "0 0 0 6px rgba(249,115,22,0.18)",
+                    zIndex: 3,
+                  }}
+                  title={`Camera y=${cameraMapY.toFixed(3)}, z=${cameraMapZ.toFixed(3)}`}
+                />
+                {mapPoints3d.slice(0, 160).map((point) => {
+                  const left = 50 + (point.z - cameraMapZ) * sideMapScale;
+                  const top = 50 - (point.y - cameraMapY) * sideMapScale * sideYExaggeration;
+                  if (left < -10 || left > 110 || top < -10 || top > 110) return null;
+
+                  const isMissing = point.status === "missing";
+                  const size = Math.max(3, Math.min(8, 3 + point.hits * 0.25));
+                  const color = isMissing ? "#64748b" : point.isLocal ? "#facc15" : point.quality > 0.6 ? "#22c55e" : "#38bdf8";
+
+                  return (
+                    <div
+                      key={`side-map-point-${point.id}`}
+                      style={{
+                        position: "absolute",
+                        left: `${left}%`,
+                        top: `${top}%`,
+                        width: size,
+                        height: size,
+                        borderRadius: "50%",
+                        transform: "translate(-50%, -50%)",
+                        background: color,
+                        opacity: isMissing ? 0.45 : 0.9,
+                        border: point.isLocal ? "2px solid rgba(254,240,138,0.95)" : "1px solid rgba(255,255,255,0.6)",
+                        pointerEvents: "none",
+                      }}
+                      title={`Landmark ${point.id}: x=${point.x.toFixed(3)}, y=${point.y.toFixed(3)}, z=${point.z.toFixed(3)}, q=${point.quality.toFixed(2)}, ${point.status}`}
+                    />
+                  );
+                })}
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 12,
+                    bottom: 10,
+                    color: "#cbd5e1",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    background: "rgba(2,6,23,0.68)",
+                    border: "1px solid rgba(148,163,184,0.24)",
+                    borderRadius: 999,
+                    padding: "6px 10px",
+                  }}
+                >
+                  Side Z/Y · radius ~{sideMapExtent.toFixed(2)}{sideYExaggeration > 1 ? ` · Y x${sideYExaggeration}` : ""}
+                </div>
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                  gap: 8,
+                  marginTop: 10,
+                  fontSize: 12,
+                }}
+              >
+                {[
+                  ["X range", mapRangeX.toFixed(2)],
+                  ["Y range", mapRangeY.toFixed(2)],
+                  ["Z range", mapRangeZ.toFixed(2)],
+                ].map(([label, value]) => (
+                  <div
+                    key={String(label)}
+                    style={{
+                      background: "#f8fafc",
+                      border: "1px solid #e2e8f0",
+                      borderRadius: 12,
+                      padding: "8px 10px",
+                    }}
+                  >
+                    <div style={{ color: "#64748b", fontWeight: 700 }}>{label}</div>
+                    <div style={{ color: "#0f172a", fontWeight: 800, marginTop: 2 }}>{String(value)}</div>
+                  </div>
+                ))}
+              </div>
+              <div
+                style={{
                   display: "grid",
                   gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
                   gap: 8,
@@ -2117,15 +2386,28 @@ export default function Home() {
                   ["Visible", cameraPoseData?.visible_landmark_count ?? 0],
                   ["Persistent", cameraPoseData?.persistent_landmark_count ?? 0],
                   ["Missing", cameraPoseData?.missing_landmark_count ?? 0],
-                  ["Stable", cameraPoseData?.stable_landmark_count ?? 0],
+                  ["2D stable", cameraPoseData?.stable_2d_landmark_count ?? 0],
+                  ["Geom verified", cameraPoseData?.geometry_verified_landmark_count ?? 0],
+                  ["Triangulated", cameraPoseData?.triangulated_landmark_count ?? 0],
                   ["Keyframes", cameraPoseData?.keyframes ?? 0],
                   ["Local map", cameraPoseData?.local_landmark_count ?? 0],
                   ["Local visible", cameraPoseData?.local_visible_landmark_count ?? 0],
+                  ["Geom inliers", cameraPoseData?.geometric_inlier_count ?? 0],
                   ["Covis edges", cameraPoseData?.covisibility_edges ?? 0],
+                  ["Baseline", Number(cameraPoseData?.local_keyframe_baseline ?? 0).toFixed(3)],
                   ["BA refined", cameraPoseData?.ba_lite?.landmarks_refined ?? 0],
+                  ["BA low parallax", cameraPoseData?.ba_lite?.last_skipped_low_parallax ?? 0],
+                  ["SW BA", cameraPoseData?.sliding_ba?.last_status || "n/a"],
+                  ["SW BA obs", cameraPoseData?.sliding_ba?.last_observations ?? 0],
+                  ["BA rejected", cameraPoseData?.sliding_ba?.last_rejected ?? 0],
+                  ["Tri rej angle", cameraPoseData?.triangulation?.rejected_angle ?? 0],
+                  ["Tri rej reproj", cameraPoseData?.triangulation?.rejected_reprojection ?? 0],
+                  ["Depth disagree", cameraPoseData?.triangulation?.depth_disagreement ?? 0],
                   ["PnP anchors", cameraPoseData?.pnp_anchor_scope || "n/a"],
+                  ["SLAM", cameraPoseData?.slam_backend || "n/a"],
                   ["Re-associated", landmarkLifecycle.descriptor_reassociated ?? 0],
                   ["Pruned", landmarkLifecycle.pruned ?? 0],
+                  ["Features", featureBackend.mode || "n/a"],
                   ["XFeat", descriptorBackend.status || "n/a"],
                 ].map(([label, value]) => (
                   <div
@@ -2142,6 +2424,25 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+              {mapHealthNotes.length > 0 && (
+                <div
+                  style={{
+                    marginTop: 10,
+                    padding: "10px 12px",
+                    borderRadius: 14,
+                    background: "#fffbeb",
+                    border: "1px solid #fde68a",
+                    color: "#92400e",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    lineHeight: 1.45,
+                  }}
+                >
+                  {mapHealthNotes.map((note) => (
+                    <div key={note}>{note}</div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
@@ -2189,7 +2490,7 @@ export default function Home() {
                       alt="Processed frame"
                       style={{ width: "auto", height: "100%", maxWidth: "100%", objectFit: "contain", display: "block" }}
                     />
-                    {embodiedState.processedFrameLandmarks.slice(0, 80).map((point: any) => {
+                    {embodiedState.processedFrameLandmarks.slice(0, 180).map((point: any) => {
                       const imageXY = point?.image_xy;
                       if (!Array.isArray(imageXY) || imageXY.length < 2) return null;
 
@@ -2236,6 +2537,39 @@ export default function Home() {
                   </span>
                 )}
               </div>
+              <div style={{ marginTop: 14 }}>
+                <div style={{ color: "#475569", fontSize: 13, fontWeight: 800, marginBottom: 8 }}>
+                  Depth feedback
+                </div>
+                <div
+                  style={{
+                    minHeight: 120,
+                    overflow: "hidden",
+                    background: "#020617",
+                    borderRadius: 14,
+                    border: "1px solid #e2e8f0",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  {embodiedState.depthDebugUrl ? (
+                    <img
+                      src={embodiedState.depthDebugUrl}
+                      alt="Depth feedback"
+                      style={{
+                        width: "100%",
+                        height: "auto",
+                        maxHeight: 180,
+                        objectFit: "contain",
+                        display: "block",
+                      }}
+                    />
+                  ) : (
+                    <span style={{ color: "#cbd5e1", fontSize: 12 }}>(No depth feedback yet)</span>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
@@ -2274,43 +2608,6 @@ export default function Home() {
               >
                 {embodiedState.worldDebugText || "(No world debug yet)"}
               </pre>
-            </div>
-
-            <div style={{ ...cardStyle(), padding: 18 }}>
-              <h2 style={{ marginTop: 0, fontSize: 18 }}>Depth map</h2>
-              <div
-                style={{
-                  height: 200,
-                  overflow: "hidden",
-                  background: "#020617",
-                  borderRadius: 14,
-                  border: "1px solid #e2e8f0",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
-              >
-                {embodiedState.depthDebugUrl ? (
-                  <div
-                    style={{
-                      position: "relative",
-                      width: "fit-content",
-                      height: "100%",
-                      maxWidth: "100%",
-                      margin: "0 auto",
-                      background: "#020617",
-                    }}
-                  >
-                    <img
-                      src={embodiedState.depthDebugUrl}
-                      alt="Depth debug"
-                      style={{ width: "auto", height: "100%", maxWidth: "100%", objectFit: "contain", display: "block" }}
-                    />
-                  </div>
-                ) : (
-                  <span style={{ color: "#cbd5e1", fontSize: 12 }}>(No depth map yet)</span>
-                )}
-              </div>
             </div>
 
             <div style={{ ...cardStyle(), padding: 18 }}>
