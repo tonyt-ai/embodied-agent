@@ -166,6 +166,8 @@ class AnchorDepthStabilizer:
             "reason": "no-pose",
             "anchors_considered": 0,
             "anchors_used": 0,
+            "triangulated_anchors": 0,
+            "stable_anchors": 0,
             "fit_scale": 1.0,
             "fit_offset": 0.0,
             "median_abs_error": None,
@@ -211,35 +213,71 @@ class AnchorDepthStabilizer:
             debug["reset_count"] = self.reset_count
             return depth_map, debug
 
-        anchor_source = "local-map" if len(local_sparse_map) >= MIN_STABILIZATION_ANCHORS else "visible-map"
-        anchor_map = local_sparse_map if anchor_source == "local-map" else sparse_map
-        debug["anchor_source"] = anchor_source
+        def collect_anchor_pairs(anchor_map, *, require_triangulated=False, require_stable=False):
+            pairs = []
+            triangulated_count = 0
+            stable_count = 0
+            for point in anchor_map:
+                if require_triangulated and not point.get("is_triangulated"):
+                    continue
+                if require_stable and not (
+                    point.get("is_geometry_verified")
+                    or point.get("is_triangulated")
+                ):
+                    continue
+                if point.get("is_triangulated"):
+                    triangulated_count += 1
+                if point.get("is_geometry_verified"):
+                    stable_count += 1
+
+                image_xy = point.get("image_xy")
+                position_world = point.get("position_world")
+                hits = int(point.get("hits", 0))
+                if point.get("is_local_map"):
+                    hits += 1
+                if not image_xy or not position_world or len(image_xy) < 2 or len(position_world) < 3:
+                    continue
+                if hits < 2:
+                    continue
+
+                world_point = np.array(position_world, dtype=np.float32)
+                camera_point = rotation_cw @ (world_point - camera_position_world)
+                expected_depth = float(camera_point[2])
+                if not np.isfinite(expected_depth) or expected_depth <= 0.0:
+                    continue
+
+                u = float(image_xy[0])
+                v = float(image_xy[1])
+                predicted_depth = _sample_depth_value(depth_map, u, v)
+                if not np.isfinite(predicted_depth) or predicted_depth <= 0.0:
+                    continue
+
+                pairs.append((predicted_depth, expected_depth))
+            return pairs, triangulated_count, stable_count
+
+        anchor_candidates = [
+            ("triangulated-local-map", local_sparse_map, True, False),
+            ("triangulated-visible-map", sparse_map, True, False),
+            ("stable-local-map", local_sparse_map, False, True),
+            ("stable-visible-map", sparse_map, False, True),
+        ]
 
         anchor_pairs = []
-        for point in anchor_map:
-            image_xy = point.get("image_xy")
-            position_world = point.get("position_world")
-            hits = int(point.get("hits", 0))
-            if anchor_source == "visible-map" and point.get("is_local_map"):
-                hits += 1
-            if not image_xy or not position_world or len(image_xy) < 2 or len(position_world) < 3:
+        for anchor_source, anchor_map, require_triangulated, require_stable in anchor_candidates:
+            if not anchor_map:
                 continue
-            if hits < 2:
+            candidate_pairs, triangulated_count, stable_count = collect_anchor_pairs(
+                anchor_map,
+                require_triangulated=require_triangulated,
+                require_stable=require_stable,
+            )
+            if len(candidate_pairs) < MIN_STABILIZATION_ANCHORS:
                 continue
-
-            world_point = np.array(position_world, dtype=np.float32)
-            camera_point = rotation_cw @ (world_point - camera_position_world)
-            expected_depth = float(camera_point[2])
-            if expected_depth <= 0.0:
-                continue
-
-            u = float(image_xy[0])
-            v = float(image_xy[1])
-            predicted_depth = _sample_depth_value(depth_map, u, v)
-            if not np.isfinite(predicted_depth) or predicted_depth <= 0.0:
-                continue
-
-            anchor_pairs.append((predicted_depth, expected_depth))
+            anchor_pairs = candidate_pairs
+            debug["anchor_source"] = anchor_source
+            debug["triangulated_anchors"] = triangulated_count
+            debug["stable_anchors"] = stable_count
+            break
 
         debug["anchors_considered"] = len(anchor_pairs)
         if len(anchor_pairs) < MIN_STABILIZATION_ANCHORS:
@@ -254,6 +292,13 @@ class AnchorDepthStabilizer:
 
         pred = np.array([pair[0] for pair in anchor_pairs], dtype=np.float32)
         expected = np.array([pair[1] for pair in anchor_pairs], dtype=np.float32)
+        finite_mask = np.isfinite(pred) & np.isfinite(expected)
+        pred = pred[finite_mask]
+        expected = expected[finite_mask]
+        if len(pred) < MIN_STABILIZATION_ANCHORS:
+            debug["reason"] = "invalid-anchor-values"
+            debug["reset_count"] = self.reset_count
+            return depth_map, debug
 
         if float(np.ptp(pred)) < 1e-5:
             scale = float(np.median(expected) / max(np.median(pred), 1e-6))

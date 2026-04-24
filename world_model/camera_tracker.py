@@ -14,6 +14,11 @@ import numpy as np
 import os
 import sys
 
+try:
+    from scipy.optimize import least_squares
+except Exception:
+    least_squares = None
+
 MAX_PNP_REPROJECTION_ERROR = 10.0
 MAX_PNP_POSITION_JUMP = 0.75
 MAX_MISSING_FRAMES = 180
@@ -23,8 +28,14 @@ MIN_HITS_FOR_PERSISTENCE = 2
 XFEAT_TOP_K = 512
 XFEAT_UPDATE_EVERY = 4
 XFEAT_MATCH_RADIUS_PX = 12.0
+FEATURE_BACKEND = os.environ.get("FEATURE_BACKEND", "hybrid").lower()
 MIN_REOBSERVATION_SIMILARITY = 0.78
 MAX_REOBSERVATION_DISTANCE_PX = 90.0
+FEATURE_QUALITY_LEVEL = 0.005
+FEATURE_MIN_DISTANCE = 7
+FEATURE_BLOCK_SIZE = 5
+FEATURE_GRID_COLS = 4
+FEATURE_GRID_ROWS = 3
 KEYFRAME_MIN_INTERVAL = 12
 KEYFRAME_MIN_TRANSLATION = 0.04
 KEYFRAME_MIN_VISIBLE = 35
@@ -32,14 +43,42 @@ MAX_KEYFRAMES = 20
 MAX_OBSERVATIONS_PER_LANDMARK = 8
 STABLE_MIN_OBSERVATIONS = 2
 STABLE_MAX_REPROJECTION_ERROR = 8.0
+STABLE_2D_MIN_HITS = 8
+GEOMETRY_VERIFIED_MIN_OBSERVATIONS = 2
+GEOMETRY_VERIFIED_MAX_REPROJECTION_ERROR = 10.0
+GEOMETRY_VERIFIED_MIN_RAY_ANGLE_DEG = 0.5
+TRIANGULATED_MIN_RAY_ANGLE_DEG = 0.8
+TRIANGULATED_MAX_REPROJECTION_ERROR = 10.0
+TRIANGULATED_MAX_DEPTH_ERROR = 0.45
 BA_LITE_MIN_OBSERVATIONS = 2
 BA_LITE_MAX_INITIAL_ERROR = 25.0
 BA_LITE_BLEND = 0.35
 BA_LITE_MAX_UPDATES_PER_KEYFRAME = 80
+BA_LITE_MIN_BASELINE = 0.03
+BA_LITE_MIN_RAY_ANGLE_DEG = 1.0
+SLIDING_BA_MAX_KEYFRAMES = 4
+SLIDING_BA_MAX_LANDMARKS = 35
+SLIDING_BA_MAX_RESIDUAL_OBS = 160
+SLIDING_BA_MIN_OBSERVATIONS = 2
+SLIDING_BA_MIN_KEYFRAMES = 2
+SLIDING_BA_MAX_NFEV = 35
+SLIDING_BA_RUN_EVERY_N_KEYFRAMES = 2
+SLIDING_BA_ROTATION_PRIOR_WEIGHT = 2.0
+SLIDING_BA_TRANSLATION_PRIOR_WEIGHT = 20.0
+SLIDING_BA_POINT_PRIOR_WEIGHT = 2.0
+SLIDING_BA_DEPTH_PRIOR_WEIGHT = 0.0
+SLIDING_BA_MAX_LANDMARK_ERROR = 12.0
+SLIDING_BA_MIN_LANDMARK_HITS = 4
 COVISIBILITY_MIN_SHARED = 8
 LOCAL_MAP_MAX_KEYFRAMES = 5
 LOCAL_MAP_MAX_LANDMARKS = 180
 MIN_LOCAL_PNP_ANCHORS = 6
+VISIBLE_MAP_EXPORT_LIMIT = 180
+GEOMETRY_EXPORT_MIN_OBSERVATIONS = 2
+GEOMETRY_EXPORT_MAX_REPROJECTION_ERROR = 9.0
+RELATIVE_POSE_MIN_INLIERS = 20
+RELATIVE_POSE_MAX_TRANSLATION = 0.08
+LK_FORWARD_BACKWARD_MAX_ERROR_PX = 2.0
 
 
 class XFeatDescriptorBackend:
@@ -126,6 +165,12 @@ class XFeatDescriptorBackend:
             return None
         return descriptors[idx].copy()
 
+    def keypoints(self, gray: np.ndarray, limit: int) -> np.ndarray | None:
+        keypoints, _ = self._compute(gray)
+        if keypoints is None or len(keypoints) == 0 or limit <= 0:
+            return None
+        return keypoints[:limit, :2].astype(np.float32)
+
     def debug_info(self) -> dict:
         return {
             "backend": "xfeat",
@@ -137,10 +182,48 @@ class XFeatDescriptorBackend:
         }
 
 
+class OrbFeatureBackend:
+    """Fast CPU ORB feature adapter used for keypoint seeding/debug A-B tests."""
+
+    def __init__(self, top_k: int = XFEAT_TOP_K):
+        self.top_k = top_k
+        self.status = "ready"
+        self.last_error = None
+        self._orb = cv2.ORB_create(
+            nfeatures=max(top_k, 300),
+            scaleFactor=1.2,
+            nlevels=8,
+            edgeThreshold=12,
+            fastThreshold=8,
+        )
+
+    def keypoints(self, gray: np.ndarray, limit: int) -> np.ndarray | None:
+        if limit <= 0:
+            return None
+        try:
+            keypoints = self._orb.detect(gray, None)
+        except cv2.error as exc:
+            self.last_error = str(exc)
+            self.status = "error"
+            return None
+        if not keypoints:
+            return None
+        keypoints = sorted(keypoints, key=lambda item: item.response, reverse=True)[:limit]
+        return np.asarray([kp.pt for kp in keypoints], dtype=np.float32)
+
+    def debug_info(self) -> dict:
+        return {
+            "backend": "orb",
+            "status": self.status,
+            "top_k": self.top_k,
+            "last_error": self.last_error,
+        }
+
+
 class CameraTracker:
     """Estimate camera motion and maintain a sparse landmark map."""
 
-    def __init__(self, max_points: int = 120, min_points: int = 40):
+    def __init__(self, max_points: int = 220, min_points: int = 70):
         self.max_points = max_points
         self.min_points = min_points
         self.prev_gray = None
@@ -152,6 +235,7 @@ class CameraTracker:
         self.rotation_wc = np.eye(3, dtype=np.float32)
         self.landmarks = {}
         self.descriptor_backend = XFeatDescriptorBackend()
+        self.orb_backend = OrbFeatureBackend()
         self.keyframes = []
         self.next_keyframe_id = 1
         self.last_keyframe_frame = 0
@@ -160,12 +244,36 @@ class CameraTracker:
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
         self.last_pnp_anchor_scope = "none"
+        self.essential_translation_scale = 0.02
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
             "last_refined": 0,
+            "last_skipped_low_parallax": 0,
             "last_mean_error_before": None,
             "last_mean_error_after": None,
+        }
+        self.sliding_ba_stats = {
+            "available": least_squares is not None,
+            "runs": 0,
+            "last_status": "not-run",
+            "last_keyframes": 0,
+            "last_landmarks": 0,
+            "last_observations": 0,
+            "last_candidates": 0,
+            "last_rejected": 0,
+            "last_cost_before": None,
+            "last_cost_after": None,
+        }
+        self.triangulation_stats = {
+            "candidates": 0,
+            "accepted": 0,
+            "rejected_observations": 0,
+            "rejected_angle": 0,
+            "rejected_solver": 0,
+            "rejected_reprojection": 0,
+            "rejected_depth": 0,
+            "depth_disagreement": 0,
         }
         self.lifecycle_stats = {
             "created": 0,
@@ -175,6 +283,34 @@ class CameraTracker:
             "marked_missing": 0,
             "pruned": 0,
         }
+
+    def _triangulated_landmark_count(self) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("is_triangulated"))
+
+    def _stable_2d_landmark_count(self) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("is_2d_stable"))
+
+    def _geometry_verified_landmark_count(self) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("is_geometry_verified"))
+
+    def _is_geometry_owned_landmark(self, landmark: dict) -> bool:
+        """True when a landmark's world position should be owned by geometry, not per-frame depth."""
+        return bool(
+            landmark.get("is_triangulated")
+            or landmark.get("is_geometry_verified")
+            or landmark.get("ba_lite_refined")
+            or landmark.get("sliding_ba_refined")
+        )
+
+    def _is_geometry_exportable_landmark(self, landmark: dict) -> bool:
+        if not self._is_geometry_owned_landmark(landmark):
+            return False
+        if int(landmark.get("observation_count", 0)) < GEOMETRY_EXPORT_MIN_OBSERVATIONS:
+            return False
+        reproj = landmark.get("mean_reprojection_error")
+        if reproj is None:
+            return False
+        return float(reproj) <= GEOMETRY_EXPORT_MAX_REPROJECTION_ERROR
 
     def reset(self):
         self.prev_gray = None
@@ -193,12 +329,36 @@ class CameraTracker:
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
         self.last_pnp_anchor_scope = "none"
+        self.essential_translation_scale = 0.02
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
             "last_refined": 0,
+            "last_skipped_low_parallax": 0,
             "last_mean_error_before": None,
             "last_mean_error_after": None,
+        }
+        self.sliding_ba_stats = {
+            "available": least_squares is not None,
+            "runs": 0,
+            "last_status": "not-run",
+            "last_keyframes": 0,
+            "last_landmarks": 0,
+            "last_observations": 0,
+            "last_candidates": 0,
+            "last_rejected": 0,
+            "last_cost_before": None,
+            "last_cost_after": None,
+        }
+        self.triangulation_stats = {
+            "candidates": 0,
+            "accepted": 0,
+            "rejected_observations": 0,
+            "rejected_angle": 0,
+            "rejected_solver": 0,
+            "rejected_reprojection": 0,
+            "rejected_depth": 0,
+            "depth_disagreement": 0,
         }
         self.lifecycle_stats = {
             "created": 0,
@@ -240,8 +400,17 @@ class CameraTracker:
             "missing_landmark_count": self._count_landmarks("missing"),
             "landmark_lifecycle": dict(self.lifecycle_stats),
             "descriptor_backend": self.descriptor_backend.debug_info(),
+            "feature_backend": {
+                "mode": FEATURE_BACKEND,
+                "xfeat": self.descriptor_backend.debug_info(),
+                "orb": self.orb_backend.debug_info(),
+            },
             "keyframes": len(self.keyframes),
             "stable_landmark_count": self._stable_landmark_count(),
+            "stable_2d_landmark_count": self._stable_2d_landmark_count(),
+            "geometry_verified_landmark_count": self._geometry_verified_landmark_count(),
+            "triangulated_landmark_count": self._triangulated_landmark_count(),
+            "triangulation": dict(self.triangulation_stats),
             "mean_stable_reprojection_error": self._mean_stable_reprojection_error(),
             "latest_keyframe": self.keyframes[-1] if self.keyframes else None,
             "covisibility_edges": self._covisibility_edge_count(),
@@ -249,8 +418,10 @@ class CameraTracker:
             "local_keyframes": list(self.local_keyframe_ids),
             "local_landmark_count": len(self.local_landmark_ids),
             "local_visible_landmark_count": len(self._export_local_visible_map()),
+            "local_keyframe_baseline": self._local_keyframe_baseline(),
             "pnp_anchor_scope": self.last_pnp_anchor_scope,
             "ba_lite": dict(self.ba_lite_stats),
+            "sliding_ba": dict(self.sliding_ba_stats),
             "pnp_inliers": int(pnp_inliers),
             "pnp_reprojection_error": None if pnp_reprojection_error is None else round(float(pnp_reprojection_error), 4),
             "sparse_map": sparse_map,
@@ -261,14 +432,101 @@ class CameraTracker:
     def _prepare(self, frame: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+    def _feature_mask(self, gray: np.ndarray) -> np.ndarray:
+        mask = np.full(gray.shape, 255, dtype=np.uint8)
+        if self.prev_points is None:
+            return mask
+
+        for point in self.prev_points.reshape(-1, 2):
+            cv2.circle(
+                mask,
+                (int(round(float(point[0]))), int(round(float(point[1])))),
+                FEATURE_MIN_DISTANCE,
+                0,
+                thickness=-1,
+            )
+        return mask
+
+    def _detect_grid_features(self, gray: np.ndarray, max_corners: int, mask=None) -> np.ndarray | None:
+        if max_corners <= 0:
+            return None
+
+        height, width = gray.shape[:2]
+        per_cell = max(4, int(np.ceil(max_corners / max(FEATURE_GRID_COLS * FEATURE_GRID_ROWS, 1))) + 2)
+        candidates = []
+        occupied = []
+
+        for row in range(FEATURE_GRID_ROWS):
+            y1 = int(round(row * height / FEATURE_GRID_ROWS))
+            y2 = int(round((row + 1) * height / FEATURE_GRID_ROWS))
+            for col in range(FEATURE_GRID_COLS):
+                x1 = int(round(col * width / FEATURE_GRID_COLS))
+                x2 = int(round((col + 1) * width / FEATURE_GRID_COLS))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                cell = gray[y1:y2, x1:x2]
+                cell_mask = None if mask is None else mask[y1:y2, x1:x2]
+                points = cv2.goodFeaturesToTrack(
+                    cell,
+                    maxCorners=per_cell,
+                    qualityLevel=FEATURE_QUALITY_LEVEL,
+                    minDistance=FEATURE_MIN_DISTANCE,
+                    blockSize=FEATURE_BLOCK_SIZE,
+                    mask=cell_mask,
+                )
+                if points is None:
+                    continue
+
+                for point in points.reshape(-1, 2):
+                    u = float(point[0] + x1)
+                    v = float(point[1] + y1)
+                    candidates.append((u, v))
+
+        learned_candidates = []
+        if FEATURE_BACKEND in {"xfeat", "hybrid"} and self.descriptor_backend.available:
+            xfeat_points = self.descriptor_backend.keypoints(gray, max_corners)
+            if xfeat_points is not None:
+                learned_candidates.extend((float(point[0]), float(point[1])) for point in xfeat_points.reshape(-1, 2))
+        if FEATURE_BACKEND in {"orb", "hybrid"}:
+            orb_points = self.orb_backend.keypoints(gray, max_corners)
+            if orb_points is not None:
+                learned_candidates.extend((float(point[0]), float(point[1])) for point in orb_points.reshape(-1, 2))
+
+        filtered_learned_candidates = []
+        for u, v in learned_candidates:
+            if mask is not None:
+                x = int(np.clip(round(u), 0, width - 1))
+                y = int(np.clip(round(v), 0, height - 1))
+                if int(mask[y, x]) == 0:
+                    continue
+            filtered_learned_candidates.append((u, v))
+
+        candidates = filtered_learned_candidates + candidates
+
+        if not candidates:
+            return None
+
+        if self.prev_points is not None:
+            occupied.extend((float(point[0]), float(point[1])) for point in self.prev_points.reshape(-1, 2))
+
+        selected = []
+        min_dist_sq = float(FEATURE_MIN_DISTANCE * FEATURE_MIN_DISTANCE)
+        for u, v in candidates:
+            if len(selected) >= max_corners:
+                break
+            too_close = any((u - ox) ** 2 + (v - oy) ** 2 < min_dist_sq for ox, oy in occupied)
+            if too_close:
+                continue
+            selected.append([u, v])
+            occupied.append((u, v))
+
+        if not selected:
+            return None
+        return np.asarray(selected, dtype=np.float32).reshape(-1, 1, 2)
+
     def _detect_features(self, gray: np.ndarray) -> np.ndarray | None:
-        return cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=self.max_points,
-            qualityLevel=0.01,
-            minDistance=10,
-            blockSize=7,
-        )
+        return self._detect_grid_features(gray, self.max_points)
 
     def _append_new_tracks(self, gray: np.ndarray):
         existing = 0 if self.prev_points is None else len(self.prev_points)
@@ -276,13 +534,7 @@ class CameraTracker:
         if needed <= 0:
             return
 
-        new_points = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=needed,
-            qualityLevel=0.01,
-            minDistance=10,
-            blockSize=7,
-        )
+        new_points = self._detect_grid_features(gray, needed, mask=self._feature_mask(gray))
         if new_points is None or len(new_points) == 0:
             return
 
@@ -386,6 +638,26 @@ class CameraTracker:
             for keyframe_id, shared in sorted(neighbors.items(), key=lambda item: item[1], reverse=True)[:8]
         ]
 
+    def _local_keyframe_baseline(self):
+        positions = []
+        local_ids = set(self.local_keyframe_ids)
+        for keyframe in self.keyframes:
+            if int(keyframe["id"]) not in local_ids:
+                continue
+            position = keyframe.get("camera_position_world")
+            if not position or len(position) < 3:
+                continue
+            positions.append(np.asarray(position, dtype=np.float32))
+
+        if len(positions) < 2:
+            return 0.0
+
+        max_distance = 0.0
+        for idx, position in enumerate(positions):
+            for other in positions[idx + 1:]:
+                max_distance = max(max_distance, float(np.linalg.norm(position - other)))
+        return round(max_distance, 4)
+
     def _rebuild_covisibility_graph(self):
         live_keyframe_ids = {int(item["id"]) for item in self.keyframes}
         pair_counts = {}
@@ -441,8 +713,10 @@ class CameraTracker:
                 continue
 
             score = (
+                int(bool(landmark.get("is_triangulated"))),
+                int(bool(landmark.get("is_geometry_verified"))),
                 len(observed_keyframes),
-                int(bool(landmark.get("is_stable"))),
+                int(bool(landmark.get("is_2d_stable"))),
                 float(landmark.get("quality", 0.0)),
                 int(landmark.get("hits", 0)),
                 int(landmark.get("last_seen", 0)),
@@ -464,6 +738,7 @@ class CameraTracker:
                 1 for item in self.landmarks.values()
                 if item.get("status") in {"visible", "missing"}
                 and int(item.get("hits", 0)) >= MIN_HITS_FOR_PERSISTENCE
+                and self._is_geometry_owned_landmark(item)
             )
         return sum(1 for item in self.landmarks.values() if item.get("status") == status)
 
@@ -536,41 +811,57 @@ class CameraTracker:
         visible.sort(
             key=lambda item: (
                 item.get("is_local_map", False),
-                item.get("is_stable", False),
+                item.get("is_triangulated", False),
+                item.get("is_geometry_verified", False),
+                item.get("is_2d_stable", False),
                 item.get("quality", 0.0),
                 item.get("hits", 0),
                 item.get("last_seen", 0),
             ),
             reverse=True,
         )
-        return visible[:80]
+        return visible[:VISIBLE_MAP_EXPORT_LIMIT]
 
     def _export_local_visible_map(self):
-        visible = [
+        visible_geometry = [
+            self._public_landmark(item) for track_id, item in self.landmarks.items()
+            if (
+                track_id in self.local_landmark_ids
+                and item.get("status") == "visible"
+                and self._is_geometry_exportable_landmark(item)
+            )
+        ]
+        visible_fallback = [
             self._public_landmark(item) for track_id, item in self.landmarks.items()
             if track_id in self.local_landmark_ids and item.get("status") == "visible"
         ]
+        visible = visible_geometry if visible_geometry else visible_fallback
         visible.sort(
             key=lambda item: (
-                item.get("is_stable", False),
+                item.get("is_triangulated", False),
+                item.get("is_geometry_verified", False),
+                item.get("is_2d_stable", False),
                 item.get("quality", 0.0),
                 item.get("hits", 0),
                 item.get("last_seen", 0),
             ),
             reverse=True,
         )
-        return visible[:80]
+        return visible[:VISIBLE_MAP_EXPORT_LIMIT]
 
     def _export_persistent_map(self):
         persistent = [
             self._public_landmark(item) for item in self.landmarks.values()
             if item.get("status") in {"visible", "missing"}
             and int(item.get("hits", 0)) >= MIN_HITS_FOR_PERSISTENCE
+            and self._is_geometry_owned_landmark(item)
         ]
         persistent.sort(
             key=lambda item: (
                 item.get("is_local_map", False),
-                item.get("is_stable", False),
+                item.get("is_triangulated", False),
+                item.get("is_geometry_verified", False),
+                item.get("is_2d_stable", False),
                 item.get("status") == "visible",
                 item.get("quality", 0.0),
                 item.get("hits", 0),
@@ -601,6 +892,60 @@ class CameraTracker:
             ],
             dtype=np.float32,
         )
+
+    def _estimate_relative_pose_from_flow(self, old_points, new_points, intrinsics):
+        if intrinsics is None or old_points is None or new_points is None or len(new_points) < 8:
+            return None
+
+        try:
+            camera_matrix = self._camera_matrix(intrinsics)
+            essential, inlier_mask = cv2.findEssentialMat(
+                old_points.astype(np.float32),
+                new_points.astype(np.float32),
+                camera_matrix,
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=1.5,
+            )
+            if essential is None or inlier_mask is None:
+                return None
+
+            _, rotation_21, translation_21, pose_mask = cv2.recoverPose(
+                essential,
+                old_points.astype(np.float32),
+                new_points.astype(np.float32),
+                camera_matrix,
+            )
+        except cv2.error:
+            return None
+
+        if pose_mask is not None:
+            pose_inlier_mask = pose_mask.reshape(-1) > 0
+        else:
+            pose_inlier_mask = inlier_mask.reshape(-1) > 0
+        inliers = int(pose_inlier_mask.sum())
+        if inliers < RELATIVE_POSE_MIN_INLIERS:
+            return None
+
+        flow = np.linalg.norm(new_points - old_points, axis=1)
+        median_flow = float(np.median(flow)) if len(flow) else 0.0
+        fx = max(float(intrinsics.get("fx", 1.0)), 1.0)
+        # Keep monocular scale independent from per-frame depth.
+        flow_ratio = median_flow / fx
+        scale = self.essential_translation_scale * float(np.clip(0.5 + 10.0 * flow_ratio, 0.5, 2.0))
+        scale = float(np.clip(scale, 0.005, RELATIVE_POSE_MAX_TRANSLATION))
+        translation_dir = translation_21.reshape(3).astype(np.float32)
+        norm = float(np.linalg.norm(translation_dir))
+        if norm <= 1e-6:
+            return None
+        translation_dir = translation_dir / norm
+        return {
+            "rotation_21": rotation_21.astype(np.float32),
+            "translation_21": translation_dir,
+            "scale": scale,
+            "inliers": inliers,
+            "inlier_mask": pose_inlier_mask,
+        }
 
     def _project_world_point(self, world_point, rotation_cw, camera_position_world, intrinsics) -> np.ndarray | None:
         world_point = np.asarray(world_point, dtype=np.float32)
@@ -660,6 +1005,20 @@ class CameraTracker:
             return None
         return point.astype(np.float32)
 
+    def _observation_geometry(self, observations):
+        if len(observations) < 2:
+            return 0.0, 0.0
+
+        rays = [self._ray_from_observation(obs) for obs in observations]
+        max_baseline = 0.0
+        max_angle = 0.0
+        for idx, (origin, direction) in enumerate(rays):
+            for other_origin, other_direction in rays[idx + 1:]:
+                max_baseline = max(max_baseline, float(np.linalg.norm(origin - other_origin)))
+                dot = float(np.clip(np.dot(direction, other_direction), -1.0, 1.0))
+                max_angle = max(max_angle, float(np.degrees(np.arccos(dot))))
+        return max_baseline, max_angle
+
     def _mean_reprojection_error_for_point(self, world_point, observations):
         errors = []
         for obs in observations:
@@ -677,10 +1036,435 @@ class CameraTracker:
             return None
         return float(np.mean(errors))
 
+    def _mean_depth_error_for_point(self, world_point, observations):
+        errors = []
+        world_point = np.asarray(world_point, dtype=np.float32)
+        for obs in observations:
+            expected_depth = obs.get("depth")
+            if expected_depth is None:
+                continue
+            rotation_cw = np.asarray(obs["rotation_cw"], dtype=np.float32)
+            camera_position_world = np.asarray(obs["camera_position_world"], dtype=np.float32)
+            camera_point = rotation_cw @ (world_point - camera_position_world)
+            if float(camera_point[2]) <= 1e-6:
+                continue
+            errors.append(abs(float(camera_point[2]) - float(expected_depth)))
+        if not errors:
+            return None
+        return float(np.mean(errors))
+
+    def _refresh_triangulated_landmark(self, track_id):
+        landmark = self.landmarks.get(track_id)
+        if not landmark:
+            return
+        observations = landmark.get("observations", [])
+        if len(observations) < BA_LITE_MIN_OBSERVATIONS:
+            landmark["is_triangulated"] = False
+            self.triangulation_stats["rejected_observations"] += 1
+            return
+
+        self.triangulation_stats["candidates"] += 1
+        baseline, ray_angle = self._observation_geometry(observations)
+        landmark["triangulation_baseline"] = round(baseline, 4)
+        landmark["triangulation_angle_deg"] = round(ray_angle, 3)
+        if ray_angle < TRIANGULATED_MIN_RAY_ANGLE_DEG:
+            landmark["is_triangulated"] = False
+            self.triangulation_stats["rejected_angle"] += 1
+            return
+
+        triangulated = self._triangulate_from_observations(observations)
+        if triangulated is None:
+            landmark["is_triangulated"] = False
+            self.triangulation_stats["rejected_solver"] += 1
+            return
+
+        reprojection_error = self._mean_reprojection_error_for_point(triangulated, observations)
+        depth_error = self._mean_depth_error_for_point(triangulated, observations)
+        observed_depths = [
+            float(obs["depth"])
+            for obs in observations
+            if obs.get("depth") is not None and np.isfinite(float(obs["depth"]))
+        ]
+        mean_depth = float(np.mean(observed_depths)) if observed_depths else None
+        max_depth_error = (
+            max(TRIANGULATED_MAX_DEPTH_ERROR, 0.35 * mean_depth)
+            if mean_depth is not None
+            else TRIANGULATED_MAX_DEPTH_ERROR
+        )
+        landmark["triangulated_position_world"] = np.round(triangulated, 4).tolist()
+        landmark["triangulated_reprojection_error"] = (
+            round(reprojection_error, 3) if reprojection_error is not None else None
+        )
+        landmark["triangulated_depth_error"] = (
+            round(depth_error, 3) if depth_error is not None else None
+        )
+        landmark["triangulated_depth_error_limit"] = round(max_depth_error, 3)
+
+        is_good = (
+            reprojection_error is not None
+            and reprojection_error <= TRIANGULATED_MAX_REPROJECTION_ERROR
+        )
+        landmark["is_triangulated"] = bool(is_good)
+        if landmark["is_triangulated"]:
+            landmark["is_geometry_verified"] = True
+        if is_good:
+            self.triangulation_stats["accepted"] += 1
+            if depth_error is not None and depth_error > max_depth_error:
+                self.triangulation_stats["depth_disagreement"] += 1
+            current_point = np.asarray(landmark.get("position_world", triangulated), dtype=np.float32)
+            landmark["position_world"] = np.round(0.5 * current_point + 0.5 * triangulated, 4).tolist()
+            landmark["position_world_source"] = "triangulated"
+        elif reprojection_error is None or reprojection_error > TRIANGULATED_MAX_REPROJECTION_ERROR:
+            self.triangulation_stats["rejected_reprojection"] += 1
+        else:
+            self.triangulation_stats["rejected_depth"] += 1
+
+    def _sliding_ba_window(self):
+        if least_squares is None:
+            self.sliding_ba_stats["last_status"] = "scipy-unavailable"
+            return None
+
+        if len(self.keyframes) < SLIDING_BA_MIN_KEYFRAMES:
+            self.sliding_ba_stats["last_status"] = "too-few-keyframes"
+            return None
+
+        local_ids = list(self.local_keyframe_ids)
+        if len(local_ids) < SLIDING_BA_MIN_KEYFRAMES:
+            local_ids = [int(item["id"]) for item in self.keyframes[-SLIDING_BA_MAX_KEYFRAMES:]]
+        local_ids = local_ids[-SLIDING_BA_MAX_KEYFRAMES:]
+        keyframe_by_id = {int(item["id"]): item for item in self.keyframes if int(item["id"]) in set(local_ids)}
+        keyframe_ids = [keyframe_id for keyframe_id in local_ids if keyframe_id in keyframe_by_id]
+        if len(keyframe_ids) < SLIDING_BA_MIN_KEYFRAMES:
+            self.sliding_ba_stats["last_status"] = "too-few-local-keyframes"
+            return None
+
+        scored_landmarks = []
+        candidates_seen = 0
+        candidates_rejected = 0
+        for track_id, landmark in self.landmarks.items():
+            world = landmark.get("position_world")
+            if not world or len(world) < 3:
+                continue
+            if not self._is_geometry_owned_landmark(landmark):
+                continue
+            observations = [
+                obs for obs in landmark.get("observations", [])
+                if int(obs.get("keyframe_id", -1)) in keyframe_by_id
+            ]
+            observed_keyframes = {int(obs["keyframe_id"]) for obs in observations}
+            if len(observed_keyframes) < SLIDING_BA_MIN_OBSERVATIONS:
+                continue
+            candidates_seen += 1
+            if int(landmark.get("hits", 0)) < SLIDING_BA_MIN_LANDMARK_HITS:
+                candidates_rejected += 1
+                continue
+            mean_error = landmark.get("mean_reprojection_error")
+            if mean_error is not None and float(mean_error) > SLIDING_BA_MAX_LANDMARK_ERROR:
+                candidates_rejected += 1
+                continue
+            baseline, ray_angle = self._observation_geometry(observations)
+            if baseline < BA_LITE_MIN_BASELINE or ray_angle < BA_LITE_MIN_RAY_ANGLE_DEG:
+                candidates_rejected += 1
+                continue
+            observed_depths = [
+                float(depth)
+                for depth in (
+                    obs.get("depth", landmark.get("depth"))
+                    for obs in observations
+                )
+                if depth is not None
+            ]
+            depth_variance = float(np.var(observed_depths)) if len(observed_depths) >= 2 else 0.0
+            score = (
+                int(track_id in self.local_landmark_ids),
+                int(bool(landmark.get("is_triangulated"))),
+                int(bool(landmark.get("is_geometry_verified"))),
+                int(bool(landmark.get("is_2d_stable"))),
+                len(observations),
+                -depth_variance,
+                float(landmark.get("quality", 0.0)),
+                int(landmark.get("hits", 0)),
+            )
+            scored_landmarks.append((score, track_id, observations))
+
+        scored_landmarks.sort(reverse=True)
+        selected = scored_landmarks[:SLIDING_BA_MAX_LANDMARKS]
+        self.sliding_ba_stats["last_candidates"] = candidates_seen
+        self.sliding_ba_stats["last_rejected"] = candidates_rejected
+        if not selected:
+            self.sliding_ba_stats["last_status"] = "no-parallax-landmarks"
+            return None
+
+        observations = []
+        for _, track_id, landmark_observations in selected:
+            for obs in landmark_observations:
+                observations.append((track_id, int(obs["keyframe_id"]), obs))
+                if len(observations) >= SLIDING_BA_MAX_RESIDUAL_OBS:
+                    break
+            if len(observations) >= SLIDING_BA_MAX_RESIDUAL_OBS:
+                break
+
+        landmark_ids = sorted({track_id for track_id, _, _ in observations})
+        if len(landmark_ids) < 6 or len(observations) < 12:
+            self.sliding_ba_stats["last_status"] = "too-few-observations"
+            return None
+
+        return keyframe_ids, keyframe_by_id, landmark_ids, observations
+
+    def _pack_sliding_ba_parameters(self, keyframe_ids, keyframe_by_id, landmark_ids):
+        fixed_keyframe_id = keyframe_ids[0]
+        variable_keyframe_ids = keyframe_ids[1:]
+        params = []
+        pose_priors = {}
+        point_priors = {}
+
+        for keyframe_id in variable_keyframe_ids:
+            keyframe = keyframe_by_id[keyframe_id]
+            rotation_cw = np.asarray(keyframe["rotation_cw"], dtype=np.float64)
+            rvec, _ = cv2.Rodrigues(rotation_cw)
+            position = np.asarray(keyframe["camera_position_world"], dtype=np.float64)
+            pose_priors[keyframe_id] = (rvec.reshape(3).copy(), position.reshape(3).copy())
+            params.extend(rvec.reshape(3).tolist())
+            params.extend(position.reshape(3).tolist())
+
+        for track_id in landmark_ids:
+            point = np.asarray(self.landmarks[track_id]["position_world"], dtype=np.float64)
+            point_priors[track_id] = point.reshape(3).copy()
+            params.extend(point.reshape(3).tolist())
+
+        return np.asarray(params, dtype=np.float64), fixed_keyframe_id, variable_keyframe_ids, pose_priors, point_priors
+
+    def _unpack_sliding_ba_parameters(self, params, keyframe_ids, keyframe_by_id, landmark_ids, fixed_keyframe_id, variable_keyframe_ids):
+        pose_params = {}
+        offset = 0
+        fixed_keyframe = keyframe_by_id[fixed_keyframe_id]
+        pose_params[fixed_keyframe_id] = (
+            np.asarray(fixed_keyframe["rotation_cw"], dtype=np.float64),
+            np.asarray(fixed_keyframe["camera_position_world"], dtype=np.float64),
+        )
+
+        for keyframe_id in variable_keyframe_ids:
+            rvec = params[offset:offset + 3].reshape(3, 1)
+            offset += 3
+            position = params[offset:offset + 3]
+            offset += 3
+            rotation_cw, _ = cv2.Rodrigues(rvec)
+            pose_params[keyframe_id] = (rotation_cw, position)
+
+        point_params = {}
+        for track_id in landmark_ids:
+            point_params[track_id] = params[offset:offset + 3]
+            offset += 3
+        return pose_params, point_params
+
+    def _sliding_ba_residuals(
+        self,
+        params,
+        keyframe_ids,
+        keyframe_by_id,
+        landmark_ids,
+        observations,
+        fixed_keyframe_id,
+        variable_keyframe_ids,
+        pose_priors=None,
+        point_priors=None,
+        include_priors=True,
+    ):
+        pose_params, point_params = self._unpack_sliding_ba_parameters(
+            params,
+            keyframe_ids,
+            keyframe_by_id,
+            landmark_ids,
+            fixed_keyframe_id,
+            variable_keyframe_ids,
+        )
+        residuals = []
+        for track_id, keyframe_id, obs in observations:
+            rotation_cw, camera_position_world = pose_params[keyframe_id]
+            projected = self._project_world_point(
+                point_params[track_id],
+                rotation_cw,
+                camera_position_world,
+                obs["intrinsics"],
+            )
+            if projected is None:
+                residuals.extend([50.0, 50.0])
+                continue
+            image_xy = np.asarray(obs["image_xy"], dtype=np.float64)
+            residuals.extend((projected.astype(np.float64) - image_xy).tolist())
+
+        if include_priors:
+            pose_priors = pose_priors or {}
+            point_priors = point_priors or {}
+            offset = 0
+            for keyframe_id in variable_keyframe_ids:
+                rvec = params[offset:offset + 3]
+                offset += 3
+                position = params[offset:offset + 3]
+                offset += 3
+                prior = pose_priors.get(keyframe_id)
+                if prior is not None:
+                    prior_rvec, prior_position = prior
+                    residuals.extend(((rvec - prior_rvec) * SLIDING_BA_ROTATION_PRIOR_WEIGHT).tolist())
+                    residuals.extend(((position - prior_position) * SLIDING_BA_TRANSLATION_PRIOR_WEIGHT).tolist())
+
+            for track_id in landmark_ids:
+                point = params[offset:offset + 3]
+                offset += 3
+                prior_point = point_priors.get(track_id)
+                if prior_point is not None:
+                    residuals.extend(((point - prior_point) * SLIDING_BA_POINT_PRIOR_WEIGHT).tolist())
+
+            if SLIDING_BA_DEPTH_PRIOR_WEIGHT > 0.0:
+                for track_id, keyframe_id, obs in observations:
+                    expected_depth = obs.get("depth")
+                    if expected_depth is None:
+                        residuals.append(0.0)
+                        continue
+                    rotation_cw, camera_position_world = pose_params[keyframe_id]
+                    world_point = point_params[track_id]
+                    camera_point = rotation_cw @ (world_point - camera_position_world)
+                    if float(camera_point[2]) <= 1e-6:
+                        residuals.append(50.0)
+                        continue
+                    residuals.append((float(camera_point[2]) - float(expected_depth)) * SLIDING_BA_DEPTH_PRIOR_WEIGHT)
+        return np.asarray(residuals, dtype=np.float64)
+
+    def _update_observation_poses(self, optimized_keyframe_ids: set[int], pose_params):
+        for landmark in self.landmarks.values():
+            for obs in landmark.get("observations", []):
+                keyframe_id = int(obs.get("keyframe_id", -1))
+                if keyframe_id not in optimized_keyframe_ids:
+                    continue
+                rotation_cw, camera_position_world = pose_params[keyframe_id]
+                obs["rotation_cw"] = np.round(rotation_cw, 6).tolist()
+                obs["camera_position_world"] = np.round(camera_position_world, 4).tolist()
+
+    def _run_sliding_window_ba(self):
+        window = self._sliding_ba_window()
+        if window is None:
+            return
+
+        keyframe_ids, keyframe_by_id, landmark_ids, observations = window
+        if len(self.keyframes) % SLIDING_BA_RUN_EVERY_N_KEYFRAMES != 0:
+            self.sliding_ba_stats["last_status"] = "skipped-throttle"
+            return
+
+        params0, fixed_keyframe_id, variable_keyframe_ids, pose_priors, point_priors = self._pack_sliding_ba_parameters(
+            keyframe_ids,
+            keyframe_by_id,
+            landmark_ids,
+        )
+        residuals0 = self._sliding_ba_residuals(
+            params0,
+            keyframe_ids,
+            keyframe_by_id,
+            landmark_ids,
+            observations,
+            fixed_keyframe_id,
+            variable_keyframe_ids,
+            pose_priors,
+            point_priors,
+            False,
+        )
+        if residuals0.size == 0:
+            self.sliding_ba_stats["last_status"] = "empty-residuals"
+            return
+
+        try:
+            result = least_squares(
+                self._sliding_ba_residuals,
+                params0,
+                args=(
+                    keyframe_ids,
+                    keyframe_by_id,
+                    landmark_ids,
+                    observations,
+                    fixed_keyframe_id,
+                    variable_keyframe_ids,
+                    pose_priors,
+                    point_priors,
+                    True,
+                ),
+                loss="huber",
+                f_scale=4.0,
+                max_nfev=SLIDING_BA_MAX_NFEV,
+                x_scale="jac",
+                verbose=0,
+            )
+        except Exception as exc:
+            self.sliding_ba_stats["last_status"] = f"failed: {str(exc)[:80]}"
+            return
+
+        pose_params, point_params = self._unpack_sliding_ba_parameters(
+            result.x,
+            keyframe_ids,
+            keyframe_by_id,
+            landmark_ids,
+            fixed_keyframe_id,
+            variable_keyframe_ids,
+        )
+        optimized_keyframe_ids = set(keyframe_ids)
+        for keyframe_id, keyframe in keyframe_by_id.items():
+            rotation_cw, camera_position_world = pose_params[keyframe_id]
+            keyframe["rotation_cw"] = np.round(rotation_cw, 6).tolist()
+            keyframe["camera_position_world"] = np.round(camera_position_world, 4).tolist()
+
+        for track_id, point in point_params.items():
+            landmark = self.landmarks.get(track_id)
+            if not landmark:
+                continue
+            landmark["position_world"] = np.round(point, 4).tolist()
+            landmark["sliding_ba_refined"] = True
+            landmark["position_world_source"] = "sliding-ba"
+
+        self._update_observation_poses(optimized_keyframe_ids, pose_params)
+        latest_keyframe_id = int(self.keyframes[-1]["id"]) if self.keyframes else None
+        if latest_keyframe_id in pose_params:
+            rotation_cw, camera_position_world = pose_params[latest_keyframe_id]
+            self.rotation_wc = rotation_cw.T.astype(np.float32)
+            self.camera_position_world = camera_position_world.astype(np.float32)
+
+        for track_id in landmark_ids:
+            self._update_landmark_reprojection_stats(track_id)
+            self._refresh_triangulated_landmark(track_id)
+
+        residuals1 = self._sliding_ba_residuals(
+            result.x,
+            keyframe_ids,
+            keyframe_by_id,
+            landmark_ids,
+            observations,
+            fixed_keyframe_id,
+            variable_keyframe_ids,
+            pose_priors,
+            point_priors,
+            False,
+        )
+        cost_before = float(np.mean(np.abs(residuals0)))
+        cost_after = float(np.mean(np.abs(residuals1)))
+        if result.success:
+            status = "optimized"
+        elif cost_after < cost_before * 0.98:
+            status = "improved-max-iter"
+        else:
+            status = "max-iter"
+        self.sliding_ba_stats.update({
+            "available": True,
+            "runs": int(self.sliding_ba_stats.get("runs", 0)) + 1,
+            "last_status": status,
+            "last_keyframes": len(keyframe_ids),
+            "last_landmarks": len(landmark_ids),
+            "last_observations": len(observations),
+            "last_cost_before": round(cost_before, 3),
+            "last_cost_after": round(cost_after, 3),
+        })
+
     def _run_ba_lite(self, candidate_ids):
         before_errors = []
         after_errors = []
         refined = 0
+        skipped_low_parallax = 0
 
         for track_id in list(candidate_ids)[:BA_LITE_MAX_UPDATES_PER_KEYFRAME]:
             landmark = self.landmarks.get(track_id)
@@ -690,34 +1474,62 @@ class CameraTracker:
             if len(observations) < BA_LITE_MIN_OBSERVATIONS:
                 continue
 
-            current_point = np.asarray(landmark.get("position_world", [0.0, 0.0, 0.0]), dtype=np.float32)
-            before_error = self._mean_reprojection_error_for_point(current_point, observations)
-            if before_error is None or before_error > BA_LITE_MAX_INITIAL_ERROR:
+            baseline, ray_angle = self._observation_geometry(observations)
+            landmark["triangulation_baseline"] = round(baseline, 4)
+            landmark["triangulation_angle_deg"] = round(ray_angle, 3)
+            if baseline < BA_LITE_MIN_BASELINE or ray_angle < BA_LITE_MIN_RAY_ANGLE_DEG:
+                skipped_low_parallax += 1
                 self._update_landmark_reprojection_stats(track_id)
                 continue
+
+            geometry_owned = self._is_geometry_owned_landmark(landmark)
+            before_error = None
+            current_point = None
+            if geometry_owned:
+                world = landmark.get("position_world")
+                if not world or len(world) < 3:
+                    self._update_landmark_reprojection_stats(track_id)
+                    continue
+                current_point = np.asarray(world, dtype=np.float32)
+                before_error = self._mean_reprojection_error_for_point(current_point, observations)
+                if before_error is None or before_error > BA_LITE_MAX_INITIAL_ERROR:
+                    self._update_landmark_reprojection_stats(track_id)
+                    continue
 
             triangulated = self._triangulate_from_observations(observations)
             if triangulated is None:
                 self._update_landmark_reprojection_stats(track_id)
                 continue
 
-            candidate = (1.0 - BA_LITE_BLEND) * current_point + BA_LITE_BLEND * triangulated
+            if geometry_owned:
+                candidate = (1.0 - BA_LITE_BLEND) * current_point + BA_LITE_BLEND * triangulated
+            else:
+                candidate = triangulated
             after_error = self._mean_reprojection_error_for_point(candidate, observations)
-            if after_error is None or after_error > before_error:
+            if after_error is None:
+                self._update_landmark_reprojection_stats(track_id)
+                continue
+            if geometry_owned and after_error > before_error:
+                self._update_landmark_reprojection_stats(track_id)
+                continue
+            if not geometry_owned and after_error > STABLE_MAX_REPROJECTION_ERROR:
                 self._update_landmark_reprojection_stats(track_id)
                 continue
 
             landmark["position_world"] = np.round(candidate, 4).tolist()
             landmark["ba_lite_refined"] = True
-            landmark["ba_lite_error_before"] = round(before_error, 3)
+            landmark["position_world_source"] = "ba-lite"
+            landmark["ba_lite_error_before"] = round(before_error, 3) if before_error is not None else None
             landmark["ba_lite_error_after"] = round(after_error, 3)
             self._update_landmark_reprojection_stats(track_id)
+            self._refresh_triangulated_landmark(track_id)
             before_errors.append(before_error)
             after_errors.append(after_error)
             refined += 1
 
         self.ba_lite_stats["runs"] += 1
         self.ba_lite_stats["last_refined"] = refined
+        self.ba_lite_stats["last_skipped_low_parallax"] = skipped_low_parallax
         self.ba_lite_stats["landmarks_refined"] += refined
         self.ba_lite_stats["last_mean_error_before"] = (
             round(float(np.mean(before_errors)), 3) if before_errors else None
@@ -735,11 +1547,22 @@ class CameraTracker:
             landmark["observation_count"] = 0
             landmark["mean_reprojection_error"] = None
             landmark["is_stable"] = False
+            landmark["is_geometry_verified"] = False
+            landmark["is_2d_stable"] = int(landmark.get("hits", 0)) >= STABLE_2D_MIN_HITS
             return
 
+        landmark["is_2d_stable"] = (
+            int(landmark.get("hits", 0)) >= STABLE_2D_MIN_HITS
+            and int(landmark.get("missed_frames", 0)) == 0
+            and float(landmark.get("quality", 0.0)) >= 0.45
+        )
         errors = []
         world_point = landmark.get("position_world")
         if not world_point:
+            landmark["observation_count"] = len(observations)
+            landmark["mean_reprojection_error"] = None
+            landmark["is_stable"] = False
+            landmark["is_geometry_verified"] = False
             return
 
         for obs in observations:
@@ -757,20 +1580,32 @@ class CameraTracker:
         landmark["observation_count"] = len(observations)
         if errors:
             mean_error = float(np.mean(errors))
+            baseline, ray_angle = self._observation_geometry(observations)
             landmark["mean_reprojection_error"] = round(mean_error, 3)
+            landmark["geometry_baseline"] = round(baseline, 4)
+            landmark["geometry_ray_angle_deg"] = round(ray_angle, 3)
+            geometry_owned = self._is_geometry_owned_landmark(landmark) or bool(landmark.get("is_triangulated"))
+            landmark["is_geometry_verified"] = geometry_owned and (
+                len(observations) >= GEOMETRY_VERIFIED_MIN_OBSERVATIONS
+                and mean_error <= GEOMETRY_VERIFIED_MAX_REPROJECTION_ERROR
+                and ray_angle >= GEOMETRY_VERIFIED_MIN_RAY_ANGLE_DEG
+            )
             landmark["is_stable"] = (
                 len(observations) >= STABLE_MIN_OBSERVATIONS
                 and mean_error <= STABLE_MAX_REPROJECTION_ERROR
             )
+            if landmark["is_geometry_verified"] and not landmark.get("position_world_source"):
+                landmark["position_world_source"] = "geometry"
         else:
             landmark["mean_reprojection_error"] = None
             landmark["is_stable"] = False
+            landmark["is_geometry_verified"] = False
 
     def _stable_landmark_count(self) -> int:
         return sum(1 for item in self.landmarks.values() if item.get("is_stable"))
 
     def _should_create_keyframe(self, visible_ids: set[int], pnp_inliers: int, pose_source: str) -> bool:
-        if pose_source != "pnp":
+        if pose_source not in {"pnp", "essential"}:
             return False
         if len(visible_ids) < KEYFRAME_MIN_VISIBLE or pnp_inliers < KEYFRAME_MIN_VISIBLE:
             return False
@@ -816,6 +1651,7 @@ class CameraTracker:
                 "keyframe_id": keyframe["id"],
                 "frame_index": self.frame_index,
                 "image_xy": landmark.get("image_xy", [0.0, 0.0]),
+                "depth": landmark.get("depth"),
                 "camera_position_world": keyframe["camera_position_world"],
                 "rotation_cw": keyframe["rotation_cw"],
                 "intrinsics": intrinsics_snapshot,
@@ -824,10 +1660,15 @@ class CameraTracker:
             observations.append(observation)
             landmark["observations"] = observations[-MAX_OBSERVATIONS_PER_LANDMARK:]
             self._update_landmark_reprojection_stats(track_id)
+            self._refresh_triangulated_landmark(track_id)
 
         self._rebuild_covisibility_graph()
         self._select_local_map(keyframe["id"])
         self._run_ba_lite(self.local_landmark_ids or visible_ids)
+
+    def consolidate_map(self):
+        """Run heavier local map optimization outside the frame hot path."""
+        self._run_sliding_window_ba()
 
     def _estimate_pose_from_anchors(self, points, track_ids, intrinsics):
         if intrinsics is None or points is None or len(points) < 6:
@@ -847,21 +1688,32 @@ class CameraTracker:
                 "image_point": [float(pt[0]), float(pt[1])],
                 "is_local": track_id in self.local_landmark_ids,
                 "is_stable": bool(landmark.get("is_stable")),
+                "is_2d_stable": bool(landmark.get("is_2d_stable")),
+                "is_geometry_verified": bool(landmark.get("is_geometry_verified")),
+                "is_triangulated": bool(landmark.get("is_triangulated")),
             })
 
         if len(candidates) < 6:
             return None
 
         local_candidates = [item for item in candidates if item["is_local"]]
-        stable_candidates = [item for item in candidates if item["is_stable"]]
-        if len(local_candidates) >= MIN_LOCAL_PNP_ANCHORS:
-            candidates = local_candidates
-            anchor_scope = "local-map"
-        elif len(stable_candidates) >= MIN_LOCAL_PNP_ANCHORS:
-            candidates = stable_candidates
-            anchor_scope = "stable"
+        triangulated_candidates = [item for item in candidates if item["is_triangulated"]]
+        geometry_candidates = [item for item in candidates if item["is_geometry_verified"]]
+        local_verified_candidates = [
+            item for item in local_candidates
+            if item["is_triangulated"] or item["is_geometry_verified"]
+        ]
+        if len(triangulated_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = triangulated_candidates
+            anchor_scope = "triangulated"
+        elif len(local_verified_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = local_verified_candidates
+            anchor_scope = "local-verified"
+        elif len(geometry_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = geometry_candidates
+            anchor_scope = "geometry-verified"
         else:
-            anchor_scope = "all-visible"
+            return None
 
         object_points = np.asarray([item["object_point"] for item in candidates], dtype=np.float32)
         image_points = np.asarray([item["image_point"] for item in candidates], dtype=np.float32)
@@ -890,8 +1742,10 @@ class CameraTracker:
         camera_position_world = (-rotation_wc @ tvec.reshape(3)).astype(np.float32)
 
         reprojection_error = None
+        inlier_track_ids = []
         if inliers is not None and len(inliers) > 0:
             inlier_ids = inliers.reshape(-1)
+            inlier_track_ids = [int(candidates[int(idx)]["track_id"]) for idx in inlier_ids]
             reprojected, _ = cv2.projectPoints(
                 object_points[inlier_ids],
                 rvec,
@@ -915,10 +1769,11 @@ class CameraTracker:
             "reprojection_error": reprojection_error,
             "anchor_scope": anchor_scope,
             "anchors_considered": len(candidates),
+            "inlier_track_ids": inlier_track_ids,
         }
 
     def _update_landmarks(self, points, track_ids, depth_map, intrinsics, gray=None):
-        if depth_map is None or intrinsics is None or points is None or len(points) == 0:
+        if intrinsics is None or points is None or len(points) == 0:
             self._mark_unseen_landmarks_missing(set())
             self._prune_landmarks()
             return self._export_visible_map()
@@ -927,8 +1782,7 @@ class CameraTracker:
         for track_id, pt in zip(track_ids, points):
             u = float(pt[0])
             v = float(pt[1])
-            depth_value = self._sample_depth(depth_map, u, v)
-            world_point = self._lift_pixel(u, v, depth_value, intrinsics)
+            depth_value = self._sample_depth(depth_map, u, v) if depth_map is not None else None
             should_update_descriptor = gray is not None and (
                 track_id not in self.landmarks
                 or self.landmarks[track_id].get("status") == "missing"
@@ -939,8 +1793,12 @@ class CameraTracker:
             previous_landmark = self.landmarks.get(track_id, {})
             if previous_landmark:
                 was_missing = previous_landmark.get("status") == "missing"
-                prev = np.array(previous_landmark["position_world"], dtype=np.float32)
-                world_point = 0.7 * prev + 0.3 * world_point
+                if self._is_geometry_owned_landmark(previous_landmark):
+                    world_point = np.array(previous_landmark["position_world"], dtype=np.float32)
+                    position_source = previous_landmark.get("position_world_source", "geometry")
+                else:
+                    world_point = None
+                    position_source = "uninitialized"
                 hits = previous_landmark["hits"] + 1
                 first_seen = previous_landmark.get("first_seen", self.frame_index)
                 if was_missing:
@@ -948,6 +1806,8 @@ class CameraTracker:
                 else:
                     self.lifecycle_stats["updated"] += 1
             else:
+                world_point = None
+                position_source = "uninitialized"
                 hits = 1
                 first_seen = self.frame_index
                 self.lifecycle_stats["created"] += 1
@@ -963,8 +1823,22 @@ class CameraTracker:
                     "observation_count",
                     "mean_reprojection_error",
                     "is_stable",
+                    "is_2d_stable",
+                    "is_geometry_verified",
+                    "geometry_baseline",
+                    "geometry_ray_angle_deg",
+                    "is_triangulated",
+                    "triangulated_position_world",
+                    "triangulated_reprojection_error",
+                    "triangulated_depth_error",
+                    "triangulated_depth_error_limit",
+                    "triangulation_baseline",
+                    "triangulation_angle_deg",
+                    "position_world_depth_prior",
+                    "position_world_source",
                     "is_local_map",
                     "ba_lite_refined",
+                    "sliding_ba_refined",
                     "ba_lite_error_before",
                     "ba_lite_error_after",
                 )
@@ -972,9 +1846,11 @@ class CameraTracker:
             }
             landmark_update = {
                 "id": track_id,
-                "position_world": np.round(world_point, 4).tolist(),
+                "position_world": None if world_point is None else np.round(world_point, 4).tolist(),
+                "position_world_depth_prior": None,
+                "position_world_source": position_source,
                 "image_xy": [round(u, 1), round(v, 1)],
-                "depth": round(depth_value, 4),
+                "depth": None if depth_value is None else round(float(depth_value), 4),
                 "hits": hits,
                 "first_seen": first_seen,
                 "last_seen": self.frame_index,
@@ -1012,19 +1888,16 @@ class CameraTracker:
 
             u = float(pt[0])
             v = float(pt[1])
-            depth_value = self._sample_depth(depth_map, u, v)
-            world_point = self._lift_pixel(u, v, depth_value, intrinsics)
+            depth_value = self._sample_depth(depth_map, u, v) if depth_map is not None else None
             should_update_descriptor = (
                 self.prev_gray is not None
                 and self._should_update_descriptors()
             )
             descriptor = self._extract_descriptor(self.prev_gray, u, v) if should_update_descriptor else None
-            prev = np.array(self.landmarks[track_id]["position_world"], dtype=np.float32)
-            world_point = 0.75 * prev + 0.25 * world_point
+            landmark = self.landmarks[track_id]
 
-            self.landmarks[track_id]["position_world"] = np.round(world_point, 4).tolist()
             self.landmarks[track_id]["image_xy"] = [round(u, 1), round(v, 1)]
-            self.landmarks[track_id]["depth"] = round(depth_value, 4)
+            self.landmarks[track_id]["depth"] = None if depth_value is None else round(float(depth_value), 4)
             if descriptor is not None:
                 self.landmarks[track_id]["descriptor"] = descriptor
             self.landmarks[track_id]["last_seen"] = self.frame_index
@@ -1041,8 +1914,19 @@ class CameraTracker:
 
         self._mark_unseen_landmarks_missing(visible_ids)
         self._prune_landmarks()
-        sparse_map = self._export_visible_map()
         refined_pose = dict(camera_pose)
+        geometric_inlier_ids = set(int(item) for item in refined_pose.get("geometric_inlier_ids", []) or [])
+        pose_source = str(refined_pose.get("pose_source", "unknown"))
+        keyframe_visible_ids = visible_ids
+        if pose_source == "essential" and geometric_inlier_ids:
+            keyframe_visible_ids = visible_ids.intersection(geometric_inlier_ids)
+        self._maybe_add_keyframe(
+            keyframe_visible_ids,
+            len(keyframe_visible_ids),
+            pose_source,
+            intrinsics,
+        )
+        sparse_map = self._export_visible_map()
         refined_pose["sparse_map"] = sparse_map
         refined_pose["local_sparse_map"] = self._export_local_visible_map()
         refined_pose["persistent_map"] = self._export_persistent_map()
@@ -1052,6 +1936,21 @@ class CameraTracker:
         refined_pose["persistent_landmark_count"] = len(refined_pose["persistent_map"])
         refined_pose["missing_landmark_count"] = self._count_landmarks("missing")
         refined_pose["landmark_lifecycle"] = dict(self.lifecycle_stats)
+        refined_pose["keyframes"] = len(self.keyframes)
+        refined_pose["stable_landmark_count"] = self._stable_landmark_count()
+        refined_pose["stable_2d_landmark_count"] = self._stable_2d_landmark_count()
+        refined_pose["geometry_verified_landmark_count"] = self._geometry_verified_landmark_count()
+        refined_pose["triangulated_landmark_count"] = self._triangulated_landmark_count()
+        refined_pose["triangulation"] = dict(self.triangulation_stats)
+        refined_pose["mean_stable_reprojection_error"] = self._mean_stable_reprojection_error()
+        refined_pose["latest_keyframe"] = self.keyframes[-1] if self.keyframes else None
+        refined_pose["covisibility_edges"] = self._covisibility_edge_count()
+        refined_pose["latest_covisible_keyframes"] = self._latest_covisible_keyframes()
+        refined_pose["local_keyframes"] = list(self.local_keyframe_ids)
+        refined_pose["local_landmark_count"] = len(self.local_landmark_ids)
+        refined_pose["local_keyframe_baseline"] = self._local_keyframe_baseline()
+        refined_pose["ba_lite"] = dict(self.ba_lite_stats)
+        refined_pose["sliding_ba"] = dict(self.sliding_ba_stats)
         return refined_pose
 
     def update(self, frame: np.ndarray, depth_map=None, intrinsics=None) -> dict:
@@ -1109,7 +2008,28 @@ class CameraTracker:
                 sparse_map=[],
             )
 
-        good_mask = status.reshape(-1) == 1
+        back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            gray,
+            self.prev_gray,
+            next_points,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+        if back_points is not None and back_status is not None:
+            fb_error = np.linalg.norm(
+                back_points.reshape(-1, 2) - self.prev_points.reshape(-1, 2),
+                axis=1,
+            )
+            good_mask = (
+                (status.reshape(-1) == 1)
+                & (back_status.reshape(-1) == 1)
+                & (fb_error <= LK_FORWARD_BACKWARD_MAX_ERROR_PX)
+            )
+        else:
+            fb_error = np.full((len(status.reshape(-1)),), np.inf, dtype=np.float32)
+            good_mask = status.reshape(-1) == 1
         good_new = next_points.reshape(-1, 2)[good_mask]
         good_old = self.prev_points.reshape(-1, 2)[good_mask]
         good_ids = [track_id for track_id, ok in zip(self.prev_track_ids, good_mask.tolist()) if ok]
@@ -1132,11 +2052,14 @@ class CameraTracker:
             status_text = "low_confidence"
 
         prev_camera_position = self.camera_position_world.copy()
+        prev_rotation_wc = self.rotation_wc.copy()
         pose_source = "flow"
         pnp_inliers = 0
         pnp_error = None
+        geometric_inlier_ids = []
         self.last_pnp_anchor_scope = "none"
         pnp_pose = self._estimate_pose_from_anchors(good_new, good_ids, intrinsics)
+        relative_pose = self._estimate_relative_pose_from_flow(good_old, good_new, intrinsics)
         pnp_position_ok = False
         if pnp_pose is not None:
             pnp_jump = float(np.linalg.norm(pnp_pose["camera_position_world"] - prev_camera_position))
@@ -1152,27 +2075,43 @@ class CameraTracker:
             pnp_inliers = pnp_pose["inliers"]
             pnp_error = pnp_pose["reprojection_error"]
             self.last_pnp_anchor_scope = pnp_pose.get("anchor_scope", "unknown")
+            geometric_inlier_ids = pnp_pose.get("inlier_track_ids", [])
+            pnp_delta = float(np.linalg.norm(self.camera_position_world - prev_camera_position))
+            self.essential_translation_scale = float(
+                np.clip(0.8 * self.essential_translation_scale + 0.2 * pnp_delta, 0.005, RELATIVE_POSE_MAX_TRANSLATION)
+            )
             pose_source = "pnp"
+        elif relative_pose is not None:
+            rotation_21 = relative_pose["rotation_21"]
+            translation_21 = relative_pose["translation_21"]
+            self.rotation_wc = (prev_rotation_wc @ rotation_21.T).astype(np.float32)
+            camera_delta_world = prev_rotation_wc @ (-rotation_21.T @ translation_21)
+            self.camera_position_world = (
+                prev_camera_position + camera_delta_world.astype(np.float32) * float(relative_pose["scale"])
+            )
+            pnp_inliers = int(relative_pose["inliers"])
+            relative_inlier_mask = relative_pose.get("inlier_mask")
+            if relative_inlier_mask is not None:
+                geometric_inlier_ids = [
+                    int(track_id)
+                    for track_id, ok in zip(good_ids, relative_inlier_mask.tolist())
+                    if ok
+                ]
+            pose_source = "essential"
         else:
             self.camera_position_world += flow_delta
-            self.rotation_wc = np.eye(3, dtype=np.float32)
+            self.rotation_wc = prev_rotation_wc
 
         delta = self.camera_position_world - prev_camera_position
 
         sparse_map = self._update_landmarks(good_new, good_ids, depth_map, intrinsics, gray=gray)
-        visible_ids = {
-            int(track_id)
-            for track_id in good_ids
-            if track_id in self.landmarks and self.landmarks[track_id].get("status") == "visible"
-        }
-        self._maybe_add_keyframe(visible_ids, pnp_inliers, pose_source, intrinsics)
 
         self.prev_gray = gray
         self.prev_points = good_new.reshape(-1, 1, 2).astype(np.float32) if len(good_new) else None
         self.prev_track_ids = good_ids
         self._append_new_tracks(gray)
 
-        return self._pose_dict(
+        pose = self._pose_dict(
             status=status_text,
             tracking_quality=tracking_quality,
             image_shift_px=[dx_px, dy_px],
@@ -1182,3 +2121,6 @@ class CameraTracker:
             pnp_inliers=pnp_inliers,
             pnp_reprojection_error=pnp_error,
         )
+        pose["geometric_inlier_ids"] = geometric_inlier_ids
+        pose["geometric_inlier_count"] = len(geometric_inlier_ids)
+        return pose
