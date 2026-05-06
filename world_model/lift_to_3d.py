@@ -2,11 +2,103 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Tuple
 
 import numpy as np
+
+_CALIBRATION_CACHE = {}
+
+
+def _calibration_path_from_env() -> str:
+    env_path = os.environ.get("CAMERA_CALIBRATION_FILE")
+    if env_path:
+        return env_path
+    base_dir = os.path.dirname(__file__)
+    return os.path.join(base_dir, "data", "camera_calibration.json")
+
+
+def _load_calibration_json(path: str) -> dict | None:
+    if not path:
+        return None
+    try:
+        abs_path = os.path.abspath(path)
+        stat = os.stat(abs_path)
+    except OSError:
+        return None
+
+    cache_key = abs_path
+    cached = _CALIBRATION_CACHE.get(cache_key)
+    if cached and cached.get("mtime_ns") == stat.st_mtime_ns:
+        return cached.get("payload")
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+
+    _CALIBRATION_CACHE[cache_key] = {
+        "mtime_ns": stat.st_mtime_ns,
+        "payload": payload,
+    }
+    return payload
+
+
+def _intrinsics_from_calibration(calibration: dict, width: int, height: int, source_path: str) -> dict | None:
+    matrix = calibration.get("camera_matrix")
+    if not matrix or len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+        return None
+
+    try:
+        fx = float(matrix[0][0])
+        fy = float(matrix[1][1])
+        cx = float(matrix[0][2])
+        cy = float(matrix[1][2])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    image_size = calibration.get("image_size") or {}
+    calib_width = int(image_size.get("width", width))
+    calib_height = int(image_size.get("height", height))
+
+    if calib_width > 0 and calib_height > 0 and (calib_width != width or calib_height != height):
+        scale_x = float(width) / float(calib_width)
+        scale_y = float(height) / float(calib_height)
+        fx *= scale_x
+        fy *= scale_y
+        cx *= scale_x
+        cy *= scale_y
+
+    dist = calibration.get("distortion_coefficients") or []
+    try:
+        dist = [float(value) for value in dist]
+    except (TypeError, ValueError):
+        dist = []
+
+    return {
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "width": width,
+        "height": height,
+        "source": "calibration-json",
+        "fov_deg": 0.0,
+        "camera_matrix": [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        "distortion_coefficients": dist,
+        "calibration_file": os.path.abspath(source_path),
+        "calibration_image_size": {
+            "width": calib_width,
+            "height": calib_height,
+        },
+    }
 
 
 def infer_camera_intrinsics(width: int, height: int) -> dict:
@@ -15,6 +107,13 @@ def infer_camera_intrinsics(width: int, height: int) -> dict:
     Env overrides are intentionally lightweight for webcam calibration:
     CAMERA_FX/CAMERA_FY/CAMERA_CX/CAMERA_CY win over CAMERA_FOV_DEG.
     """
+    calibration_path = _calibration_path_from_env()
+    calibration = _load_calibration_json(calibration_path)
+    if calibration is not None:
+        from_calibration = _intrinsics_from_calibration(calibration, width, height, calibration_path)
+        if from_calibration is not None:
+            return from_calibration
+
     fx_env = os.environ.get("CAMERA_FX")
     fy_env = os.environ.get("CAMERA_FY")
     cx_env = os.environ.get("CAMERA_CX")
@@ -59,6 +158,12 @@ def infer_camera_intrinsics(width: int, height: int) -> dict:
         "height": height,
         "source": source,
         "fov_deg": fov_deg,
+        "camera_matrix": [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        "distortion_coefficients": [],
     }
 
 

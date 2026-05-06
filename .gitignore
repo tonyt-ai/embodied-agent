@@ -22,14 +22,30 @@ out/
 .env.*
 
 # =========================
-# Data (optional)
+# Demo media / generated artifacts
 # =========================
-world_model/data/*.jsonl
+public/*.mp4
+public/**/*.jpg
+public/**/*.jpeg
+public/**/*.png
+!public/demo-ui.png
+!public/audio-processor.js
+
+world_model/data/**
+!world_model/data/
+!world_model/data/.gitkeep
+!world_model/data/camera_calibration.json
 
 # =========================
 # Models (optional)
 # =========================
 world_model/models/*.pt
+world_model/models/*.task
+*.pt
+*.onnx
+
+# Local build metadata
+tsconfig.tsbuildinfo
 
 # =========================
 # OS / misc

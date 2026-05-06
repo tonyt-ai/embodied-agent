@@ -13,34 +13,39 @@ import cv2
 import numpy as np
 import os
 import sys
+from pathlib import Path
 
 try:
     from scipy.optimize import least_squares
 except Exception:
     least_squares = None
 
-MAX_PNP_REPROJECTION_ERROR = 10.0
-MAX_PNP_POSITION_JUMP = 0.75
-MAX_MISSING_FRAMES = 180
-MAX_LANDMARKS = 600
-MIN_QUALITY_FOR_PERSISTENCE = 0.2
-MIN_HITS_FOR_PERSISTENCE = 2
-XFEAT_TOP_K = 512
-XFEAT_UPDATE_EVERY = 4
-XFEAT_MATCH_RADIUS_PX = 12.0
+MAX_PNP_REPROJECTION_ERROR = float(os.environ.get("SLAM_MAX_PNP_REPROJECTION_ERROR", "10.0"))
+MAX_PNP_POSITION_JUMP = float(os.environ.get("SLAM_MAX_PNP_POSITION_JUMP", "0.75"))
+MAX_MISSING_FRAMES = int(os.environ.get("SLAM_MAX_MISSING_FRAMES", "220"))
+MAX_LANDMARKS = int(os.environ.get("SLAM_MAX_LANDMARKS", "1800"))
+MIN_QUALITY_FOR_PERSISTENCE = float(os.environ.get("SLAM_MIN_QUALITY_FOR_PERSISTENCE", "0.2"))
+MIN_HITS_FOR_PERSISTENCE = int(os.environ.get("SLAM_MIN_HITS_FOR_PERSISTENCE", "2"))
+XFEAT_TOP_K = int(os.environ.get("SLAM_XFEAT_TOP_K", "768"))
+XFEAT_UPDATE_EVERY = int(os.environ.get("SLAM_XFEAT_UPDATE_EVERY", "4"))
+XFEAT_MATCH_RADIUS_PX = float(os.environ.get("SLAM_XFEAT_MATCH_RADIUS_PX", "12.0"))
 FEATURE_BACKEND = os.environ.get("FEATURE_BACKEND", "hybrid").lower()
 MIN_REOBSERVATION_SIMILARITY = 0.78
 MAX_REOBSERVATION_DISTANCE_PX = 90.0
-FEATURE_QUALITY_LEVEL = 0.005
-FEATURE_MIN_DISTANCE = 7
+GEOMETRY_REOBSERVATION_SIMILARITY = float(os.environ.get("SLAM_GEOMETRY_REOBSERVATION_SIMILARITY", "0.72"))
+GEOMETRY_REOBSERVATION_DISTANCE_PX = float(os.environ.get("SLAM_GEOMETRY_REOBSERVATION_DISTANCE_PX", "140.0"))
+PROTECTED_GEOMETRY_MIN_HITS = int(os.environ.get("SLAM_PROTECTED_GEOMETRY_MIN_HITS", "6"))
+PROTECTED_GEOMETRY_MISSING_MULTIPLIER = float(os.environ.get("SLAM_PROTECTED_GEOMETRY_MISSING_MULTIPLIER", "2.0"))
+FEATURE_QUALITY_LEVEL = float(os.environ.get("SLAM_FEATURE_QUALITY_LEVEL", "0.004"))
+FEATURE_MIN_DISTANCE = int(os.environ.get("SLAM_FEATURE_MIN_DISTANCE", "6"))
 FEATURE_BLOCK_SIZE = 5
 FEATURE_GRID_COLS = 4
 FEATURE_GRID_ROWS = 3
-KEYFRAME_MIN_INTERVAL = 12
-KEYFRAME_MIN_TRANSLATION = 0.04
-KEYFRAME_MIN_VISIBLE = 35
-MAX_KEYFRAMES = 20
-MAX_OBSERVATIONS_PER_LANDMARK = 8
+KEYFRAME_MIN_INTERVAL = int(os.environ.get("SLAM_KEYFRAME_MIN_INTERVAL", "8"))
+KEYFRAME_MIN_TRANSLATION = float(os.environ.get("SLAM_KEYFRAME_MIN_TRANSLATION", "0.018"))
+KEYFRAME_MIN_VISIBLE = int(os.environ.get("SLAM_KEYFRAME_MIN_VISIBLE", "28"))
+MAX_KEYFRAMES = int(os.environ.get("SLAM_MAX_KEYFRAMES", "32"))
+MAX_OBSERVATIONS_PER_LANDMARK = int(os.environ.get("SLAM_MAX_OBSERVATIONS_PER_LANDMARK", "12"))
 STABLE_MIN_OBSERVATIONS = 2
 STABLE_MAX_REPROJECTION_ERROR = 8.0
 STABLE_2D_MIN_HITS = 8
@@ -48,17 +53,19 @@ GEOMETRY_VERIFIED_MIN_OBSERVATIONS = 2
 GEOMETRY_VERIFIED_MAX_REPROJECTION_ERROR = 10.0
 GEOMETRY_VERIFIED_MIN_RAY_ANGLE_DEG = 0.5
 TRIANGULATED_MIN_RAY_ANGLE_DEG = 0.8
+TRIANGULATED_MIN_BASELINE = float(os.environ.get("SLAM_TRIANGULATED_MIN_BASELINE", "0.02"))
 TRIANGULATED_MAX_REPROJECTION_ERROR = 10.0
 TRIANGULATED_MAX_DEPTH_ERROR = 0.45
+TRIANGULATION_POSITION_BLEND = float(os.environ.get("SLAM_TRIANGULATION_POSITION_BLEND", "0.40"))
 BA_LITE_MIN_OBSERVATIONS = 2
 BA_LITE_MAX_INITIAL_ERROR = 25.0
 BA_LITE_BLEND = 0.35
-BA_LITE_MAX_UPDATES_PER_KEYFRAME = 80
+BA_LITE_MAX_UPDATES_PER_KEYFRAME = int(os.environ.get("SLAM_BA_LITE_MAX_UPDATES_PER_KEYFRAME", "120"))
 BA_LITE_MIN_BASELINE = 0.03
 BA_LITE_MIN_RAY_ANGLE_DEG = 1.0
-SLIDING_BA_MAX_KEYFRAMES = 4
-SLIDING_BA_MAX_LANDMARKS = 35
-SLIDING_BA_MAX_RESIDUAL_OBS = 160
+SLIDING_BA_MAX_KEYFRAMES = int(os.environ.get("SLAM_SLIDING_BA_MAX_KEYFRAMES", "5"))
+SLIDING_BA_MAX_LANDMARKS = int(os.environ.get("SLAM_SLIDING_BA_MAX_LANDMARKS", "90"))
+SLIDING_BA_MAX_RESIDUAL_OBS = int(os.environ.get("SLAM_SLIDING_BA_MAX_RESIDUAL_OBS", "320"))
 SLIDING_BA_MIN_OBSERVATIONS = 2
 SLIDING_BA_MIN_KEYFRAMES = 2
 SLIDING_BA_MAX_NFEV = 35
@@ -69,16 +76,39 @@ SLIDING_BA_POINT_PRIOR_WEIGHT = 2.0
 SLIDING_BA_DEPTH_PRIOR_WEIGHT = 0.0
 SLIDING_BA_MAX_LANDMARK_ERROR = 12.0
 SLIDING_BA_MIN_LANDMARK_HITS = 4
-COVISIBILITY_MIN_SHARED = 8
-LOCAL_MAP_MAX_KEYFRAMES = 5
-LOCAL_MAP_MAX_LANDMARKS = 180
-MIN_LOCAL_PNP_ANCHORS = 6
-VISIBLE_MAP_EXPORT_LIMIT = 180
+COVISIBILITY_MIN_SHARED = int(os.environ.get("SLAM_COVISIBILITY_MIN_SHARED", "6"))
+LOCAL_MAP_MAX_KEYFRAMES = int(os.environ.get("SLAM_LOCAL_MAP_MAX_KEYFRAMES", "6"))
+LOCAL_MAP_MAX_LANDMARKS = int(os.environ.get("SLAM_LOCAL_MAP_MAX_LANDMARKS", "320"))
+MIN_LOCAL_PNP_ANCHORS = int(os.environ.get("SLAM_MIN_LOCAL_PNP_ANCHORS", "4"))
+VISIBLE_MAP_EXPORT_LIMIT = int(os.environ.get("SLAM_VISIBLE_MAP_EXPORT_LIMIT", "480"))
 GEOMETRY_EXPORT_MIN_OBSERVATIONS = 2
 GEOMETRY_EXPORT_MAX_REPROJECTION_ERROR = 9.0
 RELATIVE_POSE_MIN_INLIERS = 20
 RELATIVE_POSE_MAX_TRANSLATION = 0.08
 LK_FORWARD_BACKWARD_MAX_ERROR_PX = 2.0
+PNP_MIN_INLIERS = int(os.environ.get("SLAM_PNP_MIN_INLIERS", "6"))
+PNP_LOCK_MIN_INLIERS = int(os.environ.get("SLAM_PNP_LOCK_MIN_INLIERS", "12"))
+PNP_LOCK_MAX_REPROJECTION_ERROR = float(os.environ.get("SLAM_PNP_LOCK_MAX_REPROJECTION_ERROR", "6.0"))
+ESSENTIAL_FALLBACK_SCALE_DAMPING = float(os.environ.get("SLAM_ESSENTIAL_FALLBACK_SCALE_DAMPING", "0.55"))
+ESSENTIAL_FALLBACK_MAX_TRANSLATION = float(os.environ.get("SLAM_ESSENTIAL_FALLBACK_MAX_TRANSLATION", "0.03"))
+ESSENTIAL_ROTATION_ONLY_AFTER_MISSED_PNP = int(
+    os.environ.get("SLAM_ESSENTIAL_ROTATION_ONLY_AFTER_MISSED_PNP", "10")
+)
+ESSENTIAL_KEYFRAME_MAX_FRAMES_SINCE_PNP = int(
+    os.environ.get("SLAM_ESSENTIAL_KEYFRAME_MAX_FRAMES_SINCE_PNP", "999")
+)
+ESSENTIAL_KEYFRAME_MIN_INLIERS = int(os.environ.get("SLAM_ESSENTIAL_KEYFRAME_MIN_INLIERS", "0"))
+PERSISTENT_MAP_EXPORT_LIMIT = int(os.environ.get("SLAM_PERSISTENT_MAP_EXPORT_LIMIT", "800"))
+PNP_MAX_ANCHORS = int(os.environ.get("SLAM_PNP_MAX_ANCHORS", "260"))
+SEMANTIC_DYNAMIC_ON = 0.58
+SEMANTIC_DYNAMIC_OFF = 0.42
+SEMANTIC_DYNAMIC_EMA = 0.2
+MOTION_OUTLIER_Z_ON = float(os.environ.get("SLAM_MOTION_OUTLIER_Z_ON", "3.5"))
+MOTION_OUTLIER_Z_FULL = float(os.environ.get("SLAM_MOTION_OUTLIER_Z_FULL", "8.0"))
+DYNAMIC_EVIDENCE_GATE = float(os.environ.get("SLAM_DYNAMIC_EVIDENCE_GATE", "0.90"))
+HIGH_DYNAMIC_SCORE = float(os.environ.get("SLAM_HIGH_DYNAMIC_SCORE", "0.85"))
+DYNAMIC_EVIDENCE_SEMANTIC_WEIGHT = float(os.environ.get("SLAM_DYNAMIC_SEMANTIC_WEIGHT", "0.25"))
+DYNAMIC_EVIDENCE_MOTION_WEIGHT = float(os.environ.get("SLAM_DYNAMIC_MOTION_WEIGHT", "1.00"))
 
 
 class XFeatDescriptorBackend:
@@ -98,7 +128,7 @@ class XFeatDescriptorBackend:
         self._load()
 
     def _load(self):
-        xfeat_repo = os.environ.get("XFEAT_REPO")
+        xfeat_repo = self._resolve_xfeat_repo()
         if xfeat_repo and os.path.isdir(xfeat_repo) and xfeat_repo not in sys.path:
             sys.path.insert(0, xfeat_repo)
 
@@ -119,6 +149,25 @@ class XFeatDescriptorBackend:
             self.available = False
             self.status = "unavailable"
             self.last_error = str(exc)
+
+    def _resolve_xfeat_repo(self) -> str | None:
+        configured = os.environ.get("XFEAT_REPO", "").strip()
+        if configured and os.path.isdir(configured):
+            return configured
+
+        here = Path(__file__).resolve()
+        repo_root = here.parent.parent
+        candidates = [
+            repo_root / "third_party" / "xfeat" / "accelerated_features",
+            repo_root / "xfeat" / "accelerated_features",
+            repo_root.parent / "xfeat" / "accelerated_features",
+            Path("C:/code/xfeat/accelerated_features"),
+            Path("C:/tonyt-ai/xfeat/accelerated_features"),
+        ]
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        return None
 
     def _compute(self, gray: np.ndarray):
         if not self.available or self._model is None or self._torch is None:
@@ -223,7 +272,9 @@ class OrbFeatureBackend:
 class CameraTracker:
     """Estimate camera motion and maintain a sparse landmark map."""
 
-    def __init__(self, max_points: int = 220, min_points: int = 70):
+    def __init__(self, max_points: int = 320, min_points: int = 100):
+        max_points = int(os.environ.get("SLAM_MAX_TRACK_POINTS", str(max_points)))
+        min_points = int(os.environ.get("SLAM_MIN_TRACK_POINTS", str(min_points)))
         self.max_points = max_points
         self.min_points = min_points
         self.prev_gray = None
@@ -244,7 +295,8 @@ class CameraTracker:
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
         self.last_pnp_anchor_scope = "none"
-        self.essential_translation_scale = 0.02
+        self.frames_since_pnp_lock = 0
+        self.essential_translation_scale = 0.06
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
@@ -269,6 +321,7 @@ class CameraTracker:
             "candidates": 0,
             "accepted": 0,
             "rejected_observations": 0,
+            "rejected_baseline": 0,
             "rejected_angle": 0,
             "rejected_solver": 0,
             "rejected_reprojection": 0,
@@ -293,6 +346,9 @@ class CameraTracker:
     def _geometry_verified_landmark_count(self) -> int:
         return sum(1 for item in self.landmarks.values() if item.get("is_geometry_verified"))
 
+    def _dynamic_landmark_count(self) -> int:
+        return sum(1 for item in self.landmarks.values() if item.get("is_dynamic"))
+
     def _is_geometry_owned_landmark(self, landmark: dict) -> bool:
         """True when a landmark's world position should be owned by geometry, not per-frame depth."""
         return bool(
@@ -312,6 +368,16 @@ class CameraTracker:
             return False
         return float(reproj) <= GEOMETRY_EXPORT_MAX_REPROJECTION_ERROR
 
+    def _is_protected_geometry_landmark(self, landmark: dict) -> bool:
+        return bool(
+            self._is_geometry_owned_landmark(landmark)
+            and int(landmark.get("hits", 0)) >= PROTECTED_GEOMETRY_MIN_HITS
+            and (
+                bool(landmark.get("is_triangulated"))
+                or bool(landmark.get("is_geometry_verified"))
+            )
+        )
+
     def reset(self):
         self.prev_gray = None
         self.prev_points = None
@@ -329,7 +395,8 @@ class CameraTracker:
         self.local_keyframe_ids = []
         self.local_landmark_ids = set()
         self.last_pnp_anchor_scope = "none"
-        self.essential_translation_scale = 0.02
+        self.frames_since_pnp_lock = 0
+        self.essential_translation_scale = 0.06
         self.ba_lite_stats = {
             "runs": 0,
             "landmarks_refined": 0,
@@ -354,6 +421,7 @@ class CameraTracker:
             "candidates": 0,
             "accepted": 0,
             "rejected_observations": 0,
+            "rejected_baseline": 0,
             "rejected_angle": 0,
             "rejected_solver": 0,
             "rejected_reprojection": 0,
@@ -410,6 +478,7 @@ class CameraTracker:
             "stable_2d_landmark_count": self._stable_2d_landmark_count(),
             "geometry_verified_landmark_count": self._geometry_verified_landmark_count(),
             "triangulated_landmark_count": self._triangulated_landmark_count(),
+            "dynamic_landmark_count": self._dynamic_landmark_count(),
             "triangulation": dict(self.triangulation_stats),
             "mean_stable_reprojection_error": self._mean_stable_reprojection_error(),
             "latest_keyframe": self.keyframes[-1] if self.keyframes else None,
@@ -420,6 +489,7 @@ class CameraTracker:
             "local_visible_landmark_count": len(self._export_local_visible_map()),
             "local_keyframe_baseline": self._local_keyframe_baseline(),
             "pnp_anchor_scope": self.last_pnp_anchor_scope,
+            "frames_since_pnp_lock": int(self.frames_since_pnp_lock),
             "ba_lite": dict(self.ba_lite_stats),
             "sliding_ba": dict(self.sliding_ba_stats),
             "pnp_inliers": int(pnp_inliers),
@@ -573,6 +643,62 @@ class CameraTracker:
         y = int(np.clip(round(v), 0, h - 1))
         return float(depth_map[y, x])
 
+    def _sample_semantic_dynamic(self, semantic_mask: np.ndarray | None, u: float, v: float) -> float:
+        if semantic_mask is None or semantic_mask.size == 0:
+            return 0.0
+        h, w = semantic_mask.shape[:2]
+        x = int(np.clip(round(u), 0, w - 1))
+        y = int(np.clip(round(v), 0, h - 1))
+        return 1.0 if float(semantic_mask[y, x]) > 0.5 else 0.0
+
+    def _track_dynamic_evidence(self, points_new, points_old, track_ids, semantic_mask=None) -> dict[int, float]:
+        if points_new is None or points_old is None or len(points_new) == 0 or not track_ids:
+            return {}
+
+        shifts = points_new - points_old
+        median_shift = np.median(shifts, axis=0)
+        residuals = np.linalg.norm(shifts - median_shift.reshape(1, 2), axis=1)
+        residual_median = float(np.median(residuals)) if len(residuals) else 0.0
+        residual_mad = float(np.median(np.abs(residuals - residual_median))) if len(residuals) else 0.0
+        robust_sigma = max(1.4826 * residual_mad, 1e-3)
+
+        evidence = {}
+        for track_id, pt, residual in zip(track_ids, points_new, residuals.tolist()):
+            semantic_value = self._sample_semantic_dynamic(semantic_mask, float(pt[0]), float(pt[1]))
+            z = float(residual) / robust_sigma
+            motion_value = float(
+                np.clip(
+                    (z - MOTION_OUTLIER_Z_ON) / max(MOTION_OUTLIER_Z_FULL - MOTION_OUTLIER_Z_ON, 1e-6),
+                    0.0,
+                    1.0,
+                )
+            )
+            total_weight = max(DYNAMIC_EVIDENCE_SEMANTIC_WEIGHT + DYNAMIC_EVIDENCE_MOTION_WEIGHT, 1e-6)
+            combined = float(
+                np.clip(
+                    (
+                        DYNAMIC_EVIDENCE_SEMANTIC_WEIGHT * semantic_value
+                        + DYNAMIC_EVIDENCE_MOTION_WEIGHT * motion_value
+                    )
+                    / total_weight,
+                    0.0,
+                    1.0,
+                )
+            )
+            evidence[int(track_id)] = combined
+        return evidence
+
+    def _semantic_static_track_mask(self, semantic_mask: np.ndarray | None, points: np.ndarray) -> np.ndarray:
+        if points is None or len(points) == 0:
+            return np.zeros((0,), dtype=bool)
+        if semantic_mask is None or semantic_mask.size == 0:
+            return np.ones((len(points),), dtype=bool)
+        keep = np.ones((len(points),), dtype=bool)
+        for idx, pt in enumerate(points):
+            if self._sample_semantic_dynamic(semantic_mask, float(pt[0]), float(pt[1])) > 0.5:
+                keep[idx] = False
+        return keep
+
     def _should_update_descriptors(self) -> bool:
         return self.frame_index % XFEAT_UPDATE_EVERY == 0
 
@@ -596,7 +722,11 @@ class CameraTracker:
                 continue
             if landmark.get("status") != "missing":
                 continue
-            if int(landmark.get("missed_frames", 0)) > MAX_MISSING_FRAMES:
+            protected_geometry = self._is_protected_geometry_landmark(landmark)
+            max_missed = int(
+                MAX_MISSING_FRAMES * (PROTECTED_GEOMETRY_MISSING_MULTIPLIER if protected_geometry else 1.0)
+            )
+            if int(landmark.get("missed_frames", 0)) > max_missed:
                 continue
             if "descriptor" not in landmark:
                 continue
@@ -604,14 +734,25 @@ class CameraTracker:
             image_xy = landmark.get("image_xy")
             if image_xy and len(image_xy) >= 2:
                 distance = float(np.hypot(u - float(image_xy[0]), v - float(image_xy[1])))
-                if distance > MAX_REOBSERVATION_DISTANCE_PX:
+                distance_limit = (
+                    GEOMETRY_REOBSERVATION_DISTANCE_PX
+                    if protected_geometry
+                    else MAX_REOBSERVATION_DISTANCE_PX
+                )
+                if distance > distance_limit:
                     continue
 
             similarity = self._descriptor_similarity(descriptor, landmark.get("descriptor"))
-            if similarity < MIN_REOBSERVATION_SIMILARITY:
+            min_similarity = (
+                GEOMETRY_REOBSERVATION_SIMILARITY
+                if protected_geometry
+                else MIN_REOBSERVATION_SIMILARITY
+            )
+            if similarity < min_similarity:
                 continue
             recency_bonus = max(0.0, 1.0 - int(landmark.get("missed_frames", 0)) / max(MAX_MISSING_FRAMES, 1))
-            score = similarity + 0.05 * recency_bonus
+            geometry_bonus = 0.04 if protected_geometry else 0.0
+            score = similarity + 0.05 * recency_bonus + geometry_bonus
             if score > best_score:
                 best_score = score
                 best_id = track_id
@@ -624,6 +765,16 @@ class CameraTracker:
             for key, value in landmark.items()
             if key not in {"descriptor", "observations"}
         }
+
+    def _finite_world_position(self, landmark: dict):
+        for key in ("position_world", "triangulated_position_world", "position_world_depth_prior"):
+            value = landmark.get(key)
+            if not isinstance(value, (list, tuple, np.ndarray)) or len(value) < 3:
+                continue
+            point = np.asarray(value[:3], dtype=np.float32)
+            if np.isfinite(point).all():
+                return point
+        return None
 
     def _covisibility_edge_count(self) -> int:
         return sum(len(neighbors) for neighbors in self.covisibility_graph.values()) // 2
@@ -768,11 +919,14 @@ class CameraTracker:
             landmark["missed_frames"] = self.frame_index - int(landmark.get("last_seen", self.frame_index))
             age = self.frame_index - int(landmark.get("first_seen", self.frame_index))
             landmark["age"] = age
+            missed_for_quality = int(landmark.get("missed_frames", 0))
+            if self._is_protected_geometry_landmark(landmark):
+                missed_for_quality = int(np.ceil(missed_for_quality / max(PROTECTED_GEOMETRY_MISSING_MULTIPLIER, 1e-6)))
             landmark["quality"] = round(
                 self._landmark_quality(
                     int(landmark.get("hits", 0)),
                     age,
-                    int(landmark.get("missed_frames", 0)),
+                    missed_for_quality,
                 ),
                 3,
             )
@@ -781,20 +935,35 @@ class CameraTracker:
         stale_ids = []
         for track_id, landmark in self.landmarks.items():
             missed = int(landmark.get("missed_frames", 0))
-            if missed > MAX_MISSING_FRAMES:
+            max_missed = int(
+                MAX_MISSING_FRAMES
+                * (PROTECTED_GEOMETRY_MISSING_MULTIPLIER if self._is_protected_geometry_landmark(landmark) else 1.0)
+            )
+            if missed > max_missed:
                 stale_ids.append(track_id)
 
         if len(self.landmarks) - len(stale_ids) > MAX_LANDMARKS:
             candidates = sorted(
                 (
-                    (float(item.get("quality", 0.0)), int(item.get("last_seen", 0)), track_id)
+                    (
+                        int(
+                            self._is_geometry_owned_landmark(item)
+                            or bool(item.get("is_triangulated"))
+                            or bool(item.get("is_geometry_verified"))
+                        ),
+                        int(track_id in self.local_landmark_ids),
+                        int(item.get("status") == "visible"),
+                        float(item.get("quality", 0.0)),
+                        int(item.get("last_seen", 0)),
+                        track_id,
+                    )
                     for track_id, item in self.landmarks.items()
                     if track_id not in stale_ids
                 ),
-                key=lambda item: (item[0], item[1]),
+                key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
             )
             overflow = len(self.landmarks) - len(stale_ids) - MAX_LANDMARKS
-            stale_ids.extend(track_id for _, _, track_id in candidates[:overflow])
+            stale_ids.extend(track_id for *_, track_id in candidates[:overflow])
 
         for track_id in stale_ids:
             if track_id in self.landmarks:
@@ -869,7 +1038,7 @@ class CameraTracker:
             ),
             reverse=True,
         )
-        return persistent[:240]
+        return persistent[:max(120, int(PERSISTENT_MAP_EXPORT_LIMIT))]
 
     def _lift_pixel(self, u: float, v: float, depth_value: float, intrinsics: dict) -> np.ndarray:
         fx = float(intrinsics["fx"])
@@ -893,9 +1062,44 @@ class CameraTracker:
             dtype=np.float32,
         )
 
+    def _distortion_coefficients(self, intrinsics: dict) -> np.ndarray | None:
+        values = intrinsics.get("distortion_coefficients", []) if intrinsics else []
+        if values is None:
+            values = []
+        if not isinstance(values, (list, tuple, np.ndarray)):
+            values = []
+        try:
+            coeffs = np.asarray(values, dtype=np.float32).reshape(-1, 1)
+        except Exception:
+            return None
+        if coeffs.size == 0:
+            return None
+        return coeffs
+
+    def _undistort_points(self, points: np.ndarray, intrinsics: dict) -> np.ndarray:
+        if points is None or len(points) == 0 or intrinsics is None:
+            return points
+        camera_matrix = self._camera_matrix(intrinsics)
+        dist_coeffs = self._distortion_coefficients(intrinsics)
+        if dist_coeffs is None:
+            return points
+        try:
+            undistorted = cv2.undistortPoints(
+                points.reshape(-1, 1, 2).astype(np.float32),
+                camera_matrix,
+                dist_coeffs,
+                P=camera_matrix,
+            )
+            return undistorted.reshape(-1, 2).astype(np.float32)
+        except cv2.error:
+            return points
+
     def _estimate_relative_pose_from_flow(self, old_points, new_points, intrinsics):
         if intrinsics is None or old_points is None or new_points is None or len(new_points) < 8:
             return None
+
+        old_points = self._undistort_points(old_points, intrinsics)
+        new_points = self._undistort_points(new_points, intrinsics)
 
         try:
             camera_matrix = self._camera_matrix(intrinsics)
@@ -1067,6 +1271,10 @@ class CameraTracker:
         baseline, ray_angle = self._observation_geometry(observations)
         landmark["triangulation_baseline"] = round(baseline, 4)
         landmark["triangulation_angle_deg"] = round(ray_angle, 3)
+        if baseline < TRIANGULATED_MIN_BASELINE:
+            landmark["is_triangulated"] = False
+            self.triangulation_stats["rejected_baseline"] += 1
+            return
         if ray_angle < TRIANGULATED_MIN_RAY_ANGLE_DEG:
             landmark["is_triangulated"] = False
             self.triangulation_stats["rejected_angle"] += 1
@@ -1111,8 +1319,11 @@ class CameraTracker:
             self.triangulation_stats["accepted"] += 1
             if depth_error is not None and depth_error > max_depth_error:
                 self.triangulation_stats["depth_disagreement"] += 1
-            current_point = np.asarray(landmark.get("position_world", triangulated), dtype=np.float32)
-            landmark["position_world"] = np.round(0.5 * current_point + 0.5 * triangulated, 4).tolist()
+            current_point = self._finite_world_position(landmark)
+            if current_point is None:
+                current_point = triangulated
+            blend = float(np.clip(TRIANGULATION_POSITION_BLEND, 0.05, 1.0))
+            landmark["position_world"] = np.round((1.0 - blend) * current_point + blend * triangulated, 4).tolist()
             landmark["position_world_source"] = "triangulated"
         elif reprojection_error is None or reprojection_error > TRIANGULATED_MAX_REPROJECTION_ERROR:
             self.triangulation_stats["rejected_reprojection"] += 1
@@ -1142,8 +1353,8 @@ class CameraTracker:
         candidates_seen = 0
         candidates_rejected = 0
         for track_id, landmark in self.landmarks.items():
-            world = landmark.get("position_world")
-            if not world or len(world) < 3:
+            world = self._finite_world_position(landmark)
+            if world is None:
                 continue
             if not self._is_geometry_owned_landmark(landmark):
                 continue
@@ -1223,16 +1434,32 @@ class CameraTracker:
             rotation_cw = np.asarray(keyframe["rotation_cw"], dtype=np.float64)
             rvec, _ = cv2.Rodrigues(rotation_cw)
             position = np.asarray(keyframe["camera_position_world"], dtype=np.float64)
+            if not np.isfinite(rvec).all() or not np.isfinite(position).all():
+                continue
             pose_priors[keyframe_id] = (rvec.reshape(3).copy(), position.reshape(3).copy())
             params.extend(rvec.reshape(3).tolist())
             params.extend(position.reshape(3).tolist())
 
+        kept_landmark_ids = []
         for track_id in landmark_ids:
-            point = np.asarray(self.landmarks[track_id]["position_world"], dtype=np.float64)
+            point = self._finite_world_position(self.landmarks[track_id])
+            if point is None:
+                continue
+            point = point.astype(np.float64)
+            if point.shape[0] < 3 or not np.isfinite(point).all():
+                continue
+            kept_landmark_ids.append(track_id)
             point_priors[track_id] = point.reshape(3).copy()
             params.extend(point.reshape(3).tolist())
 
-        return np.asarray(params, dtype=np.float64), fixed_keyframe_id, variable_keyframe_ids, pose_priors, point_priors
+        return (
+            np.asarray(params, dtype=np.float64),
+            fixed_keyframe_id,
+            variable_keyframe_ids,
+            kept_landmark_ids,
+            pose_priors,
+            point_priors,
+        )
 
     def _unpack_sliding_ba_parameters(self, params, keyframe_ids, keyframe_by_id, landmark_ids, fixed_keyframe_id, variable_keyframe_ids):
         pose_params = {}
@@ -1350,11 +1577,19 @@ class CameraTracker:
             self.sliding_ba_stats["last_status"] = "skipped-throttle"
             return
 
-        params0, fixed_keyframe_id, variable_keyframe_ids, pose_priors, point_priors = self._pack_sliding_ba_parameters(
+        params0, fixed_keyframe_id, variable_keyframe_ids, landmark_ids, pose_priors, point_priors = self._pack_sliding_ba_parameters(
             keyframe_ids,
             keyframe_by_id,
             landmark_ids,
         )
+        if len(landmark_ids) < 6 or params0.size == 0 or not np.isfinite(params0).all():
+            self.sliding_ba_stats["last_status"] = "invalid-initial-params"
+            return
+        landmark_id_set = set(landmark_ids)
+        observations = [obs for obs in observations if obs[0] in landmark_id_set]
+        if len(observations) < 12:
+            self.sliding_ba_stats["last_status"] = "too-few-valid-observations"
+            return
         residuals0 = self._sliding_ba_residuals(
             params0,
             keyframe_ids,
@@ -1486,11 +1721,11 @@ class CameraTracker:
             before_error = None
             current_point = None
             if geometry_owned:
-                world = landmark.get("position_world")
-                if not world or len(world) < 3:
+                world = self._finite_world_position(landmark)
+                if world is None:
                     self._update_landmark_reprojection_stats(track_id)
                     continue
-                current_point = np.asarray(world, dtype=np.float32)
+                current_point = world
                 before_error = self._mean_reprojection_error_for_point(current_point, observations)
                 if before_error is None or before_error > BA_LITE_MAX_INITIAL_ERROR:
                     self._update_landmark_reprojection_stats(track_id)
@@ -1531,11 +1766,13 @@ class CameraTracker:
         self.ba_lite_stats["last_refined"] = refined
         self.ba_lite_stats["last_skipped_low_parallax"] = skipped_low_parallax
         self.ba_lite_stats["landmarks_refined"] += refined
+        before_values = [float(value) for value in before_errors if value is not None]
+        after_values = [float(value) for value in after_errors if value is not None]
         self.ba_lite_stats["last_mean_error_before"] = (
-            round(float(np.mean(before_errors)), 3) if before_errors else None
+            round(float(np.mean(before_values)), 3) if before_values else None
         )
         self.ba_lite_stats["last_mean_error_after"] = (
-            round(float(np.mean(after_errors)), 3) if after_errors else None
+            round(float(np.mean(after_values)), 3) if after_values else None
         )
 
     def _update_landmark_reprojection_stats(self, track_id):
@@ -1557,8 +1794,8 @@ class CameraTracker:
             and float(landmark.get("quality", 0.0)) >= 0.45
         )
         errors = []
-        world_point = landmark.get("position_world")
-        if not world_point:
+        world_point = self._finite_world_position(landmark)
+        if world_point is None:
             landmark["observation_count"] = len(observations)
             landmark["mean_reprojection_error"] = None
             landmark["is_stable"] = False
@@ -1607,6 +1844,14 @@ class CameraTracker:
     def _should_create_keyframe(self, visible_ids: set[int], pnp_inliers: int, pose_source: str) -> bool:
         if pose_source not in {"pnp", "essential"}:
             return False
+        if pose_source == "essential":
+            if (
+                ESSENTIAL_KEYFRAME_MAX_FRAMES_SINCE_PNP >= 0
+                and self.frames_since_pnp_lock > ESSENTIAL_KEYFRAME_MAX_FRAMES_SINCE_PNP
+            ):
+                return False
+            if ESSENTIAL_KEYFRAME_MIN_INLIERS > 0 and pnp_inliers < ESSENTIAL_KEYFRAME_MIN_INLIERS:
+                return False
         if len(visible_ids) < KEYFRAME_MIN_VISIBLE or pnp_inliers < KEYFRAME_MIN_VISIBLE:
             return False
         if not self.keyframes:
@@ -1679,22 +1924,28 @@ class CameraTracker:
             landmark = self.landmarks.get(track_id)
             if not landmark:
                 continue
-            world_point = landmark.get("position_world")
-            if not world_point or len(world_point) < 3:
+            world_point = self._finite_world_position(landmark)
+            if world_point is None:
                 continue
+            dynamic_score = float(landmark.get("dynamic_score", 0.0))
             candidates.append({
                 "track_id": track_id,
-                "object_point": world_point,
+                "object_point": world_point.tolist(),
                 "image_point": [float(pt[0]), float(pt[1])],
                 "is_local": track_id in self.local_landmark_ids,
                 "is_stable": bool(landmark.get("is_stable")),
                 "is_2d_stable": bool(landmark.get("is_2d_stable")),
                 "is_geometry_verified": bool(landmark.get("is_geometry_verified")),
                 "is_triangulated": bool(landmark.get("is_triangulated")),
+                "dynamic_score": dynamic_score,
+                "is_dynamic": bool(landmark.get("is_dynamic")),
             })
 
         if len(candidates) < 6:
             return None
+
+        def prefer_static(items):
+            return [item for item in items if float(item.get("dynamic_score", 0.0)) < HIGH_DYNAMIC_SCORE]
 
         local_candidates = [item for item in candidates if item["is_local"]]
         triangulated_candidates = [item for item in candidates if item["is_triangulated"]]
@@ -1703,22 +1954,45 @@ class CameraTracker:
             item for item in local_candidates
             if item["is_triangulated"] or item["is_geometry_verified"]
         ]
-        if len(triangulated_candidates) >= MIN_LOCAL_PNP_ANCHORS:
+        triangulated_static = prefer_static(triangulated_candidates)
+        local_verified_static = prefer_static(local_verified_candidates)
+        geometry_static = prefer_static(geometry_candidates)
+
+        if len(triangulated_static) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = triangulated_static
+            anchor_scope = "triangulated-static"
+        elif len(triangulated_candidates) >= MIN_LOCAL_PNP_ANCHORS:
             candidates = triangulated_candidates
             anchor_scope = "triangulated"
+        elif len(local_verified_static) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = local_verified_static
+            anchor_scope = "local-verified-static"
         elif len(local_verified_candidates) >= MIN_LOCAL_PNP_ANCHORS:
             candidates = local_verified_candidates
             anchor_scope = "local-verified"
+        elif len(geometry_static) >= MIN_LOCAL_PNP_ANCHORS:
+            candidates = geometry_static
+            anchor_scope = "geometry-verified-static"
         elif len(geometry_candidates) >= MIN_LOCAL_PNP_ANCHORS:
             candidates = geometry_candidates
             anchor_scope = "geometry-verified"
         else:
             return None
 
+        candidates = sorted(
+            candidates,
+            key=lambda item: (
+                float(item.get("dynamic_score", 0.0)),
+                int(not item.get("is_triangulated")),
+                int(not item.get("is_geometry_verified")),
+                int(not item.get("is_local")),
+            ),
+        )[:max(60, int(PNP_MAX_ANCHORS))]
+
         object_points = np.asarray([item["object_point"] for item in candidates], dtype=np.float32)
         image_points = np.asarray([item["image_point"] for item in candidates], dtype=np.float32)
         camera_matrix = self._camera_matrix(intrinsics)
-        dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+        dist_coeffs = self._distortion_coefficients(intrinsics)
 
         try:
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -1736,6 +2010,31 @@ class CameraTracker:
 
         if not success or rvec is None or tvec is None:
             return None
+
+        if inliers is not None and len(inliers) >= 6:
+            inlier_ids = inliers.reshape(-1).astype(np.int32)
+            try:
+                refine_success, rvec_refined, tvec_refined = cv2.solvePnP(
+                    object_points[inlier_ids],
+                    image_points[inlier_ids],
+                    camera_matrix,
+                    dist_coeffs,
+                    rvec=rvec,
+                    tvec=tvec,
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if (
+                    refine_success
+                    and rvec_refined is not None
+                    and tvec_refined is not None
+                    and np.isfinite(rvec_refined).all()
+                    and np.isfinite(tvec_refined).all()
+                ):
+                    rvec = rvec_refined
+                    tvec = tvec_refined
+            except cv2.error:
+                pass
 
         rotation_cw, _ = cv2.Rodrigues(rvec)
         rotation_wc = rotation_cw.T.astype(np.float32)
@@ -1772,7 +2071,7 @@ class CameraTracker:
             "inlier_track_ids": inlier_track_ids,
         }
 
-    def _update_landmarks(self, points, track_ids, depth_map, intrinsics, gray=None):
+    def _update_landmarks(self, points, track_ids, depth_map, intrinsics, gray=None, semantic_mask=None, dynamic_evidence_by_track=None):
         if intrinsics is None or points is None or len(points) == 0:
             self._mark_unseen_landmarks_missing(set())
             self._prune_landmarks()
@@ -1789,6 +2088,10 @@ class CameraTracker:
                 or self._should_update_descriptors()
             )
             descriptor = self._extract_descriptor(gray, u, v) if should_update_descriptor else None
+            dynamic_hit = self._sample_semantic_dynamic(semantic_mask, u, v)
+            dynamic_evidence = dynamic_hit
+            if dynamic_evidence_by_track and track_id in dynamic_evidence_by_track:
+                dynamic_evidence = max(dynamic_hit, float(dynamic_evidence_by_track[track_id]))
 
             previous_landmark = self.landmarks.get(track_id, {})
             if previous_landmark:
@@ -1811,6 +2114,13 @@ class CameraTracker:
                 hits = 1
                 first_seen = self.frame_index
                 self.lifecycle_stats["created"] += 1
+
+            previous_dynamic_score = float(previous_landmark.get("dynamic_score", 0.0))
+            dynamic_score = (1.0 - SEMANTIC_DYNAMIC_EMA) * previous_dynamic_score + SEMANTIC_DYNAMIC_EMA * dynamic_evidence
+            if previous_landmark.get("is_dynamic"):
+                is_dynamic = dynamic_score >= SEMANTIC_DYNAMIC_OFF
+            else:
+                is_dynamic = dynamic_score >= SEMANTIC_DYNAMIC_ON
 
             age = self.frame_index - int(first_seen)
             quality = self._landmark_quality(hits, age, missed_frames=0)
@@ -1841,6 +2151,8 @@ class CameraTracker:
                     "sliding_ba_refined",
                     "ba_lite_error_before",
                     "ba_lite_error_after",
+                    "dynamic_score",
+                    "is_dynamic",
                 )
                 if key in previous_landmark
             }
@@ -1858,6 +2170,8 @@ class CameraTracker:
                 "missed_frames": 0,
                 "status": "visible",
                 "quality": round(quality, 3),
+                "dynamic_score": round(float(dynamic_score), 4),
+                "is_dynamic": bool(is_dynamic),
             }
             landmark_update.update(preserved)
             if descriptor is not None:
@@ -1869,7 +2183,7 @@ class CameraTracker:
         self._prune_landmarks()
         return self._export_visible_map()
 
-    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict) -> dict:
+    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict, semantic_mask=None) -> dict:
         """Refresh currently visible landmarks using a corrected depth map."""
         if (
             depth_map is None
@@ -1895,6 +2209,13 @@ class CameraTracker:
             )
             descriptor = self._extract_descriptor(self.prev_gray, u, v) if should_update_descriptor else None
             landmark = self.landmarks[track_id]
+            dynamic_hit = self._sample_semantic_dynamic(semantic_mask, u, v)
+            previous_dynamic_score = float(landmark.get("dynamic_score", 0.0))
+            dynamic_score = (1.0 - SEMANTIC_DYNAMIC_EMA) * previous_dynamic_score + SEMANTIC_DYNAMIC_EMA * dynamic_hit
+            if landmark.get("is_dynamic"):
+                is_dynamic = dynamic_score >= SEMANTIC_DYNAMIC_OFF
+            else:
+                is_dynamic = dynamic_score >= SEMANTIC_DYNAMIC_ON
 
             self.landmarks[track_id]["image_xy"] = [round(u, 1), round(v, 1)]
             self.landmarks[track_id]["depth"] = None if depth_value is None else round(float(depth_value), 4)
@@ -1910,6 +2231,8 @@ class CameraTracker:
                 self._landmark_quality(int(self.landmarks[track_id].get("hits", 0)), age, 0),
                 3,
             )
+            self.landmarks[track_id]["dynamic_score"] = round(float(dynamic_score), 4)
+            self.landmarks[track_id]["is_dynamic"] = bool(is_dynamic)
             visible_ids.add(track_id)
 
         self._mark_unseen_landmarks_missing(visible_ids)
@@ -1941,6 +2264,7 @@ class CameraTracker:
         refined_pose["stable_2d_landmark_count"] = self._stable_2d_landmark_count()
         refined_pose["geometry_verified_landmark_count"] = self._geometry_verified_landmark_count()
         refined_pose["triangulated_landmark_count"] = self._triangulated_landmark_count()
+        refined_pose["dynamic_landmark_count"] = self._dynamic_landmark_count()
         refined_pose["triangulation"] = dict(self.triangulation_stats)
         refined_pose["mean_stable_reprojection_error"] = self._mean_stable_reprojection_error()
         refined_pose["latest_keyframe"] = self.keyframes[-1] if self.keyframes else None
@@ -1953,7 +2277,7 @@ class CameraTracker:
         refined_pose["sliding_ba"] = dict(self.sliding_ba_stats)
         return refined_pose
 
-    def update(self, frame: np.ndarray, depth_map=None, intrinsics=None) -> dict:
+    def update(self, frame: np.ndarray, depth_map=None, intrinsics=None, semantic_mask=None) -> dict:
         """Return a sparse-motion pose estimate and sparse landmark map."""
         gray = self._prepare(frame)
         self.frame_index += 1
@@ -2034,15 +2358,33 @@ class CameraTracker:
         good_old = self.prev_points.reshape(-1, 2)[good_mask]
         good_ids = [track_id for track_id, ok in zip(self.prev_track_ids, good_mask.tolist()) if ok]
 
-        if len(good_new) >= 4:
-            shifts = good_new - good_old
+        dynamic_evidence_by_track = self._track_dynamic_evidence(
+            good_new,
+            good_old,
+            good_ids,
+            semantic_mask=semantic_mask,
+        )
+        evidence_values = np.asarray(
+            [float(dynamic_evidence_by_track.get(track_id, 0.0)) for track_id in good_ids],
+            dtype=np.float32,
+        )
+        semantic_static_mask = evidence_values < DYNAMIC_EVIDENCE_GATE
+        static_good_new = good_new[semantic_static_mask]
+        static_good_old = good_old[semantic_static_mask]
+        static_good_ids = [track_id for track_id, ok in zip(good_ids, semantic_static_mask.tolist()) if ok]
+        geometry_new = static_good_new if len(static_good_new) >= 4 else good_new
+        geometry_old = static_good_old if len(static_good_old) >= 4 else good_old
+        geometry_ids = static_good_ids if len(static_good_ids) >= 4 else good_ids
+
+        if len(geometry_new) >= 4:
+            shifts = geometry_new - geometry_old
             dx_px = float(np.median(shifts[:, 0]))
             dy_px = float(np.median(shifts[:, 1]))
             flow_delta = np.array(
                 [-dx_px / max(frame.shape[1], 1), -dy_px / max(frame.shape[0], 1), 0.0],
                 dtype=np.float32,
             )
-            tracking_quality = float(min(1.0, len(good_new) / max(len(self.prev_track_ids), 1)))
+            tracking_quality = float(min(1.0, len(geometry_new) / max(len(self.prev_track_ids), 1)))
             status_text = "tracking"
         else:
             dx_px = 0.0
@@ -2058,8 +2400,8 @@ class CameraTracker:
         pnp_error = None
         geometric_inlier_ids = []
         self.last_pnp_anchor_scope = "none"
-        pnp_pose = self._estimate_pose_from_anchors(good_new, good_ids, intrinsics)
-        relative_pose = self._estimate_relative_pose_from_flow(good_old, good_new, intrinsics)
+        pnp_pose = self._estimate_pose_from_anchors(geometry_new, geometry_ids, intrinsics)
+        relative_pose = self._estimate_relative_pose_from_flow(geometry_old, geometry_new, intrinsics)
         pnp_position_ok = False
         if pnp_pose is not None:
             pnp_jump = float(np.linalg.norm(pnp_pose["camera_position_world"] - prev_camera_position))
@@ -2069,7 +2411,24 @@ class CameraTracker:
             )
             pnp_position_ok = pnp_jump <= MAX_PNP_POSITION_JUMP
 
-        if pnp_pose is not None and pnp_pose["inliers"] >= 6 and pnp_error_ok and pnp_position_ok:
+        pnp_lock_ready = (
+            pnp_pose is not None
+            and pnp_pose["inliers"] >= PNP_LOCK_MIN_INLIERS
+            and pnp_error_ok
+            and pnp_position_ok
+            and (
+                pnp_pose["reprojection_error"] is None
+                or pnp_pose["reprojection_error"] <= PNP_LOCK_MAX_REPROJECTION_ERROR
+            )
+        )
+        pnp_basic_ready = (
+            pnp_pose is not None
+            and pnp_pose["inliers"] >= PNP_MIN_INLIERS
+            and pnp_error_ok
+            and pnp_position_ok
+        )
+
+        if pnp_lock_ready or pnp_basic_ready:
             self.rotation_wc = pnp_pose["rotation_wc"]
             self.camera_position_world = pnp_pose["camera_position_world"]
             pnp_inliers = pnp_pose["inliers"]
@@ -2080,31 +2439,46 @@ class CameraTracker:
             self.essential_translation_scale = float(
                 np.clip(0.8 * self.essential_translation_scale + 0.2 * pnp_delta, 0.005, RELATIVE_POSE_MAX_TRANSLATION)
             )
+            self.frames_since_pnp_lock = 0
             pose_source = "pnp"
         elif relative_pose is not None:
             rotation_21 = relative_pose["rotation_21"]
             translation_21 = relative_pose["translation_21"]
             self.rotation_wc = (prev_rotation_wc @ rotation_21.T).astype(np.float32)
             camera_delta_world = prev_rotation_wc @ (-rotation_21.T @ translation_21)
+            self.frames_since_pnp_lock += 1
+            essential_scale = float(relative_pose["scale"]) * ESSENTIAL_FALLBACK_SCALE_DAMPING
+            essential_scale = float(np.clip(essential_scale, 0.0, ESSENTIAL_FALLBACK_MAX_TRANSLATION))
+            if self.frames_since_pnp_lock >= ESSENTIAL_ROTATION_ONLY_AFTER_MISSED_PNP:
+                essential_scale = float(min(essential_scale, 0.006))
             self.camera_position_world = (
-                prev_camera_position + camera_delta_world.astype(np.float32) * float(relative_pose["scale"])
+                prev_camera_position + camera_delta_world.astype(np.float32) * essential_scale
             )
             pnp_inliers = int(relative_pose["inliers"])
             relative_inlier_mask = relative_pose.get("inlier_mask")
             if relative_inlier_mask is not None:
                 geometric_inlier_ids = [
                     int(track_id)
-                    for track_id, ok in zip(good_ids, relative_inlier_mask.tolist())
+                    for track_id, ok in zip(geometry_ids, relative_inlier_mask.tolist())
                     if ok
                 ]
             pose_source = "essential"
         else:
+            self.frames_since_pnp_lock += 1
             self.camera_position_world += flow_delta
             self.rotation_wc = prev_rotation_wc
 
         delta = self.camera_position_world - prev_camera_position
 
-        sparse_map = self._update_landmarks(good_new, good_ids, depth_map, intrinsics, gray=gray)
+        sparse_map = self._update_landmarks(
+            good_new,
+            good_ids,
+            depth_map,
+            intrinsics,
+            gray=gray,
+            semantic_mask=semantic_mask,
+            dynamic_evidence_by_track=dynamic_evidence_by_track,
+        )
 
         self.prev_gray = gray
         self.prev_points = good_new.reshape(-1, 1, 2).astype(np.float32) if len(good_new) else None

@@ -57,16 +57,26 @@ class BuiltinSparseSlamBackend:
             self.tracker.sliding_ba_stats["mapping_thread"] = "background"
             self._last_scheduled_keyframe_count = 0
 
-    def update(self, frame, depth_map=None, intrinsics=None):
+    def update(self, frame, depth_map=None, intrinsics=None, semantic_mask=None):
         with self._lock:
-            pose = self.tracker.update(frame, depth_map=depth_map, intrinsics=intrinsics)
+            pose = self.tracker.update(
+                frame,
+                depth_map=depth_map,
+                intrinsics=intrinsics,
+                semantic_mask=semantic_mask,
+            )
         pose["slam_backend"] = self.name
         return pose
 
-    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict):
+    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict, semantic_mask=None):
         with self._lock:
             before_keyframes = len(self.tracker.keyframes)
-            pose = self.tracker.refine_visible_landmarks(depth_map, intrinsics, camera_pose)
+            pose = self.tracker.refine_visible_landmarks(
+                depth_map,
+                intrinsics,
+                camera_pose,
+                semantic_mask=semantic_mask,
+            )
             self._schedule_mapping_if_needed(before_keyframes)
         pose["slam_backend"] = self.name
         return pose
@@ -89,10 +99,10 @@ class ExternalSlamBackend:
     def reset(self):
         return None
 
-    def update(self, frame, depth_map=None, intrinsics=None):
+    def update(self, frame, depth_map=None, intrinsics=None, semantic_mask=None):
         raise RuntimeError(f"SLAM_BACKEND={self.name!r} is not wired yet")
 
-    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict):
+    def refine_visible_landmarks(self, depth_map, intrinsics, camera_pose: dict, semantic_mask=None):
         return camera_pose
 
 

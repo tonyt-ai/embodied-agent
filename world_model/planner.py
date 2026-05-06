@@ -45,6 +45,33 @@ ACTIONS = {
 }
 
 
+def _summarize_interactions(state):
+    interactions = list(getattr(state, "hand_object_interactions", []) or [])
+    target_label = "cup"
+    target_entries = [
+        item for item in interactions
+        if str(item.get("nearest_object_label", "")).lower() == target_label
+    ]
+    contacting = sum(1 for item in target_entries if bool(item.get("is_contacting", False)))
+    near = sum(1 for item in target_entries if bool(item.get("is_near", False)))
+    min_distance = None
+    for item in target_entries:
+        try:
+            dist = float(item.get("distance_m", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if min_distance is None or dist < min_distance:
+            min_distance = dist
+    return {
+        "target_label": target_label,
+        "hands_total": int(len(interactions)),
+        "target_interactions": int(len(target_entries)),
+        "target_contacting": int(contacting),
+        "target_near": int(near),
+        "target_min_distance_m": round(float(min_distance), 4) if min_distance is not None else None,
+    }
+
+
 def is_state_empty(state_vec, eps=1e-6):
     """Return True if `state_vec` is missing or effectively zero.
 
@@ -121,6 +148,7 @@ def simulate_all_actions(state):
     empty or the goal is already reached is handled early.
     """
     base_state = state.get_state_vector()
+    interaction_context = _summarize_interactions(state)
 
     # If no valid object visible, return an explanatory message
     if is_state_empty(base_state):
@@ -133,6 +161,7 @@ def simulate_all_actions(state):
             "rollout_depth": 2,
             "message": "No stable objects detected yet.",
             "explanation": "wait",
+            "interaction_context": interaction_context,
         }
 
     current_dist = distance_to_goal(base_state)
@@ -148,6 +177,7 @@ def simulate_all_actions(state):
             "rollout_depth": 2,
             "message": "Target reached.",
             "explanation": "stop",
+            "interaction_context": interaction_context,
         }
 
     results = {}
@@ -212,4 +242,5 @@ def simulate_all_actions(state):
         "rollout_depth": 2,
         "message": "Simulated 2-step futures for all action pairs.",
         "explanation": explanation,
+        "interaction_context": interaction_context,
     }

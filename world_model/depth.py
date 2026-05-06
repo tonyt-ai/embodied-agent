@@ -20,16 +20,17 @@ from PIL import Image
 
 DEFAULT_MODEL_ID = os.environ.get("DEPTH_ANYTHING_MODEL", "LiheYoung/depth-anything-small-hf")
 USE_HEURISTIC_ONLY = os.environ.get("DEPTH_BACKEND", "depth-anything").lower() == "heuristic"
+DEPTH_LOCAL_ONLY = os.environ.get("DEPTH_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
 
 DEPTH_MIN_RANGE = 0.35
 DEPTH_MAX_RANGE = 2.50
-LOW_PERCENTILE = 2.0
-HIGH_PERCENTILE = 98.0
-MIN_STABILIZATION_ANCHORS = 6
-MIN_TRACKING_QUALITY = 0.25
-MIN_ACTIVE_TRACKS = 12
-MAX_ALLOWED_RELATIVE_ERROR = 0.35
-MAX_SHIFT_NORM_FOR_WEAK_ANCHORS = 0.08
+LOW_PERCENTILE = float(os.environ.get("DEPTH_LOW_PERCENTILE", "2.0"))
+HIGH_PERCENTILE = float(os.environ.get("DEPTH_HIGH_PERCENTILE", "98.0"))
+MIN_STABILIZATION_ANCHORS = int(os.environ.get("DEPTH_MIN_STABILIZATION_ANCHORS", "6"))
+MIN_TRACKING_QUALITY = float(os.environ.get("DEPTH_MIN_TRACKING_QUALITY", "0.25"))
+MIN_ACTIVE_TRACKS = int(os.environ.get("DEPTH_MIN_ACTIVE_TRACKS", "12"))
+MAX_ALLOWED_RELATIVE_ERROR = float(os.environ.get("DEPTH_MAX_ALLOWED_RELATIVE_ERROR", "0.35"))
+MAX_SHIFT_NORM_FOR_WEAK_ANCHORS = float(os.environ.get("DEPTH_MAX_SHIFT_NORM_FOR_WEAK_ANCHORS", "0.08"))
 
 
 class DepthEstimator:
@@ -62,8 +63,14 @@ class DepthEstimator:
             try:
                 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-                self._processor = AutoImageProcessor.from_pretrained(self.model_id)
-                self._model = AutoModelForDepthEstimation.from_pretrained(self.model_id)
+                self._processor = AutoImageProcessor.from_pretrained(
+                    self.model_id,
+                    local_files_only=DEPTH_LOCAL_ONLY,
+                )
+                self._model = AutoModelForDepthEstimation.from_pretrained(
+                    self.model_id,
+                    local_files_only=DEPTH_LOCAL_ONLY,
+                )
                 self._model = self._model.to(self.device)
                 self._model.eval()
                 self._loaded = True

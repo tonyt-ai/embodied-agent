@@ -1,0 +1,46 @@
+{
+  "model": "opencv_pinhole_radial_tangential",
+  "image_size": {
+    "width": 1920,
+    "height": 1080
+  },
+  "pattern_size_inner_corners": [
+    9,
+    6
+  ],
+  "square_size_m": 0.022,
+  "num_images_used": 39,
+  "removed_outlier_images": [
+    "WIN_20260424_19_06_56_Pro.jpg",
+    "WIN_20260424_19_07_06_Pro.jpg",
+    "WIN_20260424_19_07_13_Pro.jpg",
+    "WIN_20260424_19_07_28_Pro.jpg"
+  ],
+  "rms_reprojection_error": 1.017069433668693,
+  "mean_reprojection_error_px": 0.12525027101102487,
+  "max_reprojection_error_px": 0.2999301005595786,
+  "camera_matrix": [
+    [
+      1703.510226598377,
+      0.0,
+      926.9410436556356
+    ],
+    [
+      0.0,
+      1622.2913219966947,
+      638.5313472817327
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion_coefficients": [
+    -0.0046590373833911135,
+    0.049645963288240745,
+    0.0018168562014027798,
+    -0.012410692246781664,
+    -0.20328196167596083
+  ]
+}
