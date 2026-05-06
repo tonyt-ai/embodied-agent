@@ -434,6 +434,7 @@ export default function Home() {
   const [serverTotalMs, setServerTotalMs] = useState<number | null>(null);
   const [pipelineAgeMs, setPipelineAgeMs] = useState<number | null>(null);
   const [uiNowMs, setUiNowMs] = useState<number>(() => Date.now());
+  const [worldStateReceivedAtMs, setWorldStateReceivedAtMs] = useState<number>(0);
   const [latchedIntentCue, setLatchedIntentCue] = useState<any | null>(null);
   const [latchedAttentionBlobs, setLatchedAttentionBlobs] = useState<any[]>([]);
   const [latchedAttentionAtMs, setLatchedAttentionAtMs] = useState<number>(0);
@@ -444,9 +445,12 @@ export default function Home() {
     ? Math.max(0, uiNowMs - processedFrameTimestamp)
     : frameAgeMs;
   const useProcessedPlanningFrame = false;
-  const planningFreshness = displayedFrameAgeMs == null
+  const worldStateFreshEnough = worldStateReceivedAtMs > 0
+    && uiNowMs - worldStateReceivedAtMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
+  const planningFreshnessAgeMs = worldStateFreshEnough ? 0 : displayedFrameAgeMs;
+  const planningFreshness = planningFreshnessAgeMs == null
     ? 0
-    : Math.max(0.08, Math.min(1, 1 - Math.max(0, displayedFrameAgeMs - 350) / 1800));
+    : Math.max(0.08, Math.min(1, 1 - Math.max(0, planningFreshnessAgeMs - 350) / 1800));
   const cameraPoseData = cameraPoseDataState ?? parseJsonSafe<any>(cameraPoseText, null);
   const worldDebugData = worldDebugDataState;
   const persistentMapData = Array.isArray(cameraPoseData?.persistent_map)
@@ -1162,7 +1166,8 @@ export default function Home() {
       attentionKindCounts[item.kind] += 1;
       return true;
     });
-  const planningFreshEnough = displayedFrameAgeMs != null && displayedFrameAgeMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
+  const planningFreshEnough = worldStateFreshEnough
+    || (displayedFrameAgeMs != null && displayedFrameAgeMs <= WORLD_STATE_ACTIONABLE_MAX_MS);
   const sceneTimelineCue = SCENE_TIMELINE_CUE_ENABLED && isEmbodiedMode && embodiedVideoSource === "scene" && sceneVideoFile === "scene_sophie.mp4"
     ? SOPHIE_SCENE_TIMELINE.find((event) => sceneVideoTimeS >= event.grabStartS - 1.2 && sceneVideoTimeS <= event.releaseS + 0.8)
     : null;
@@ -1297,6 +1302,14 @@ export default function Home() {
       : (sceneTimelineActive && sceneTimelineCaption
         ? sceneTimelineCaption
         : (activeEvent ? `${latestEventLabel}: released` : (hasHandFocus ? "hand" : "static scene"))));
+  const activeEventTargetLabel = normalizeDisplayLabel(String(
+    activeEvent?.target_label
+      || activeEvent?.place_relation?.nearest_object_label
+      || activeEvent?.place_relation?.target_label
+      || activeEvent?.place_relation?.support_target_label
+      || activeEvent?.target
+      || ""
+  ));
 
   const liveIntentCue = activeHeldInteraction
     ? {
@@ -1325,7 +1338,7 @@ export default function Home() {
             phase: intentPhase,
             caption: intentCaption,
             objectLabel: latestEventLabel,
-            targetLabel: normalizeDisplayLabel(String(activeEvent?.target_label || "")),
+            targetLabel: activeEventTargetLabel,
             objectId: String(activeEvent?.object_id || ""),
             eventState: "released",
             updatedAtMs: uiNowMs,
@@ -1357,7 +1370,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!liveIntentReadable || !liveIntentCue) return;
-    if (!useWebSpeechDebug || !autoMode) return;
+    if (!useWebSpeechDebug || !isEmbodiedMode) return;
     const state = String(liveIntentCue.eventState || "");
     if (!["predicting", "held", "releasing", "released"].includes(state)) return;
     const objectLabel = normalizeDisplayLabel(String(liveIntentCue.objectLabel || ""));
@@ -1371,7 +1384,7 @@ export default function Home() {
     const phrase = state === "releasing"
       ? `${objectLabel}: releasing near ${targetLabel}.`
       : (state === "released"
-        ? `${objectLabel}: released.`
+        ? (isTargetDisplayLabel(targetLabel) ? `${objectLabel}: released near ${targetLabel}.` : `${objectLabel}: released.`)
         : (state === "predicting"
           ? `Likely ${objectLabel}. Target: ${targetLabel}.`
           : `${objectLabel}: held. Target: ${targetLabel}.`));
@@ -1384,7 +1397,7 @@ export default function Home() {
     liveIntentCue?.objectLabel,
     liveIntentCue?.targetLabel,
     useWebSpeechDebug,
-    autoMode,
+    isEmbodiedMode,
   ]);
 
   const latchedIntentFresh = latchedIntentCue !== null
@@ -1498,6 +1511,7 @@ export default function Home() {
     setServerWorldMs(null);
     setServerTotalMs(null);
     setPipelineAgeMs(null);
+    setWorldStateReceivedAtMs(0);
     setLatchedIntentCue(null);
     setLatchedAttentionBlobs([]);
     setLatchedAttentionAtMs(0);
@@ -2069,11 +2083,13 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "state_updated") {
+          const receivedAtMs = Date.now();
+          setWorldStateReceivedAtMs(receivedAtMs);
           worldFrameInFlightRef.current = false;
           worldFrameInFlightSinceRef.current = 0;
           const responseFrameTs = Number(msg.frame_timestamp);
-          const responseAgeMs = Number.isFinite(responseFrameTs) ? Math.max(0, Date.now() - responseFrameTs) : null;
-          const stateRenderable = responseAgeMs === null || responseAgeMs <= WORLD_STATE_RENDERABLE_MAX_MS;
+          const responseAgeMs = Number.isFinite(responseFrameTs) ? Math.max(0, receivedAtMs - responseFrameTs) : null;
+          const stateRenderable = true;
           const objects = msg.objects || [];
           const cameraPose = msg.camera_pose || null;
           const objects3d = msg.objects_3d || [];
@@ -2158,14 +2174,9 @@ export default function Home() {
           }
 
           if (typeof msg.frame_timestamp === "number") {
-            const age = responseAgeMs ?? (Date.now() - msg.frame_timestamp);
+            const age = responseAgeMs ?? (receivedAtMs - msg.frame_timestamp);
             setFrameAgeMs(age);
             setPipelineAgeMs(age);
-            if (age > WORLD_STATE_RENDERABLE_MAX_MS) {
-              setLatchedIntentCue(null);
-              setLatchedAttentionBlobs([]);
-              setLatchedAttentionAtMs(0);
-            }
           }
 
           if (typeof msg.capture_ms === "number") setCaptureMs(msg.capture_ms);
@@ -2210,11 +2221,11 @@ export default function Home() {
               ? `${latestEvent?.event || ""}:${latestEvent?.object_id || ""}:${latestEvent?.time || ""}`
               : "";
             const signature = `${handSig}::${interactionSig}::${eventSig}`;
-            const nowMs = Date.now();
+            const nowMs = receivedAtMs;
             const sourceFrameTs = Number(msg.frame_timestamp);
             const sourceFrameAgeMs = Number.isFinite(sourceFrameTs) ? Math.max(0, nowMs - sourceFrameTs) : null;
-            const stateActionable = sourceFrameAgeMs !== null && sourceFrameAgeMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
             const hasActionSignal = Boolean(handSig || interactionSig || eventSig);
+            const stateActionable = hasActionSignal || (sourceFrameAgeMs !== null && sourceFrameAgeMs <= WORLD_STATE_ACTIONABLE_MAX_MS);
             if (
               hasActionSignal &&
               stateActionable &&
@@ -2302,7 +2313,9 @@ export default function Home() {
             const sourceFrameTs = Number(msg.result?.source_frame_timestamp);
             const guidanceDelayMs = Number.isFinite(sourceFrameTs) ? Math.max(0, Date.now() - sourceFrameTs) : null;
             const isGroundedMode = mode === "grabbed" || mode === "released" || mode === "releasing" || mode === "approach" || mode === "hand_detected";
-            const isFreshGuidance = guidanceDelayMs !== null && guidanceDelayMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
+            const isFreshGuidance = guidanceDelayMs === null
+              || guidanceDelayMs <= WORLD_STATE_ACTIONABLE_MAX_MS
+              || isGroundedMode;
             const isFreshRelease = mode !== "released" || !Number.isFinite(eventAgeS) || eventAgeS <= RELEASED_SPEECH_EVENT_MAX_S;
             const isFreshGrab = mode !== "grabbed" || !Number.isFinite(contactAgeS) || contactAgeS <= GRABBED_SPEECH_CONTACT_MAX_S;
 

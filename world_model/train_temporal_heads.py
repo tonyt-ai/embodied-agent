@@ -108,13 +108,20 @@ def _sophie_region_label_from_bbox(bbox) -> str:
     except (TypeError, ValueError):
         return ""
     # The Sophie scene has two stable support regions from the COLMAP/static
-    # phase: the tray on the left and the black mat on the right. This is a
-    # scene-profile prior, not a label alias for the movable object.
-    if 0.02 <= cx <= 0.47 and 0.12 <= cy <= 0.86:
-        return "tray"
-    if 0.48 <= cx <= 0.99 and 0.20 <= cy <= 0.98:
-        return "mat"
-    return ""
+    # phase: the tray/plate on the left and the black mat on the right. Use
+    # soft elliptical regions instead of a hard vertical split; the plate reaches
+    # into the center of the image, so an x cutoff incorrectly teaches tray
+    # releases as mat.
+    regions = [
+        ("tray", 0.31, 0.49, 0.36, 0.43),
+        ("mat", 0.73, 0.62, 0.34, 0.38),
+    ]
+    scored = []
+    for label, rx0, ry0, rw, rh in regions:
+        score = ((cx - rx0) / max(rw, 1e-6)) ** 2 + ((cy - ry0) / max(rh, 1e-6)) ** 2
+        scored.append((score, label))
+    score, label = min(scored, key=lambda item: item[0])
+    return label if score <= 1.85 else ""
 
 
 def _episode_label(label: str) -> str:
@@ -335,13 +342,36 @@ def refresh_episode_future_targets(rows, horizon=10):
     for i, row in enumerate(rows):
         j = min(len(rows) - 1, i + max(1, int(horizon)))
         future_slice = rows[i:j + 1]
-        future_start = next((r for r in future_slice if float(r.get("episode_starts", 0.0) or 0.0) >= 0.5), None)
-        future_end = next((r for r in future_slice if float(r.get("episode_ends", 0.0) or 0.0) >= 0.5), None)
-        future_episode = future_start or next((r for r in future_slice if float(r.get("episode_active", 0.0) or 0.0) >= 0.5), None)
+        row_label = _visual_episode_label(row)
+        row_object_id = str(row.get("object_id") or "")
+
+        def same_candidate_episode(candidate: dict) -> bool:
+            episode_label = _episode_label(candidate.get("episode_label") or candidate.get("object_label") or "")
+            candidate_object_id = str(candidate.get("object_id") or "")
+            if row_object_id and candidate_object_id and row_object_id == candidate_object_id:
+                return True
+            return bool(row_label and episode_label and row_label == episode_label)
+
+        future_start = next((
+            r for r in future_slice
+            if float(r.get("episode_starts", 0.0) or 0.0) >= 0.5 and same_candidate_episode(r)
+        ), None)
+        future_end = next((
+            r for r in future_slice
+            if float(r.get("episode_ends", 0.0) or 0.0) >= 0.5 and same_candidate_episode(r)
+        ), None)
+        future_episode = future_start or next((
+            r for r in future_slice
+            if float(r.get("episode_active", 0.0) or 0.0) >= 0.5 and same_candidate_episode(r)
+        ), None)
         row["y_contact_raw"] = float(row.get("y_contact", 0.0) or 0.0)
         row["y_episode_active"] = float(row.get("episode_active", 0.0) or 0.0)
         row["y_contact"] = 1.0 if future_start is not None else 0.0
-        row["y_release"] = 1.0 if future_end is not None and float(row.get("episode_active", 0.0) or 0.0) >= 0.5 else 0.0
+        row["y_release"] = 1.0 if (
+            future_end is not None
+            and float(row.get("episode_active", 0.0) or 0.0) >= 0.5
+            and same_candidate_episode(row)
+        ) else 0.0
         if future_episode is not None:
             row["y_target_tray"] = float(future_episode.get("y_target_tray", row.get("y_target_tray", 0.0)) or 0.0)
             row["future_episode_label"] = future_episode.get("episode_label", "")

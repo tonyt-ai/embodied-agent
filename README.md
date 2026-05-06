@@ -1,49 +1,37 @@
 # Embodied Agent
 
-A real-time, 3D-grounded world-model demo for egocentric assisted-living tasks.
+A real-time, 3D grounded world model demo for egocentric assisted-living tasks with an embodied agent.
 
-The current showcase is the Sophie scene: a hand moves a baby bottle and Sophie the giraffe between a table mat and a tray. The system watches the scene from an egocentric video, builds a persistent 3D scene prior, tracks hands and objects online, predicts likely interaction futures, asks Gemini to refine weak object labels, and speaks timely guidance through a live avatar.
-
-The focus is grounded interaction understanding:
-
-```text
-static SfM/COLMAP prior -> online SLAM/depth -> persistent objects/targets
-              -> hand-object contact -> JEPA future prediction
-              -> Gemini labels/speech -> UI heatmaps/avatar feedback
-```
+The current repository showcases hand-object interactions in a real-world environment, observed by an embodied AI agent.
+The system watches the scene from an egocentric video, builds a persistent 3D scene prior, tracks hands and objects online, predicts likely interaction futures and targets, asks an LLM (Gemini) to refine weak object labels, and speaks timely guidance through a live avatar.
 
 ![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction.jpg)
 
-Current Sophie demo overlay showing a JEPA prediction cue: the hand is tracking Sophie the giraffe, the destination heatmap is on the tray, and the UI surfaces the predicted target before the full demo is polished.
+Current demo shows JEPA prediction cues: the hand is holding Sophie the giraffe, the destination heatmap is on the tray, and the UI shows the predicted target.
 
-## What The Demo Shows
+## What The System Contains
 
-- A static-scene bootstrap from the first part of the video.
-- COLMAP sparse SfM prior plus online SLAM/depth grounding so mat, tray, hand, and objects live in one frame.
-- YOLO/FastSAM regions plus V-JEPA2.1 embeddings for object tracking and re-identification across detector flicker.
-- Gemini label refinement for objects that detectors label weakly or generically.
-- Geometry-teacher contact and release detection from hand/object distance in 3D.
-- An interaction-conditioned temporal head that predicts next contact, destination likelihood, object motion, and future latent state from recent hand-object-target state.
-- UI attention heatmaps over likely grabbed objects and predicted destinations.
-- Voice/avatar feedback aligned to hand detection, object grasp, and predicted placement.
+The current design focuses on grounded interaction understanding and consists of several modules:
 
-Note on design principle: semantic names should come from the LLM/refinement path, while geometry remains the authority for physical contact. The learned temporal head is used as an anticipatory signal, not as a replacement for 3D evidence.
-
-## Model Stack
-
-Under the hood, the Sophie profile uses:
-
+- COLMAP sparse SfM for the offline/static scene prior.
+- Online sparse SLAM/PnP for camera motion and persistent map alignment during interaction.
 - YOLOv8 for light object detection and coarse detector labels.
 - FastSAM-s for higher-recall segmentation regions in the Sophie demo profile.
 - V-JEPA2.1 embeddings for object/hand appearance memory, object tracking, re-identification, and temporal prediction features.
 - DINOv2 crop embeddings as a portability fallback and supporting baseline for tracking/re-ID.
 - MediaPipe Hands for 2D hand landmarks, lifted into 3D with depth and camera geometry.
 - Depth Anything monocular depth via Hugging Face Transformers when available, with a heuristic fallback if the model cannot load.
-- COLMAP sparse SfM for the offline/static scene prior.
-- Online sparse SLAM/PnP for camera motion and persistent map alignment during interaction.
-- A PyTorch interaction-conditioned temporal head: a JEPA-like dynamics/prediction layer over grounded hand-object-target tokens, predicting contact, placement, motion, and future latent state.
-- Gemini for semantic label refinement and assistant speech.
-- LiveAvatar for embodied speech rendering when configured.
+- Gemini label refinement for objects that detectors label weakly or generically.
+- Geometry-teacher contact and release detection from hand/object distance in 3D.
+- An interaction-conditioned temporal head that predicts next contact, destination likelihood, object motion, and future latent state from recent hand-object-target state.
+- UI attention heatmaps over likely grabbed objects and predicted destinations.
+- Voice/avatar feedback aligned to hand detection, object grasp, and predicted placement.
+
+```text
+static SfM/COLMAP prior -> online SLAM/depth -> persistent objects/targets
+              -> hand-object contact -> JEPA future prediction
+              -> Gemini labels/speech -> UI heatmaps/avatar feedback
+```
 
 ## LLM And Avatar Bridge
 
@@ -100,8 +88,6 @@ The demo expects these local videos:
 - `public/scene_sophie.mp4` for training.
 - `public/scene_sophie_test.mp4` for held-out evaluation/playback.
 
-Large videos, generated rows, COLMAP outputs, and model artifacts are ignored by Git. Keep them local, in Git LFS, or as release assets.
-
 ## Train And Evaluate JEPA
 
 Train the Sophie interaction-conditioned temporal head:
@@ -143,38 +129,7 @@ TEMPORAL_HEAD_CONTACT_THRESHOLD=0.20
 TEMPORAL_HEAD_PLACEMENT_THRESHOLD=0.45
 ```
 
-Actual grasp/release still comes from geometry.
-
-## How Far The World Model Goes
-
-What is solid now:
-
-- Persistent 3D state for static targets and movable objects.
-- Online hand localization, hand trails, and hand-object proximity/contact.
-- Object persistence across weak detector labels using geometry plus DINOv2 appearance embeddings.
-- Learned interaction-conditioned prediction for contact, placement, motion, and future latent features.
-- COLMAP sparse SfM prior plus online SLAM/depth for a physical world frame from commodity video.
-- LLM bridge for label refinement and live speech/avatar feedback.
-- Offline train/test evaluation for the temporal head and interaction pipeline.
-
-What remains research-grade:
-
-- More training captures are needed for stronger held-out temporal-head recall.
-- The current model predicts short-horizon futures, not long multi-step plans.
-- It is not yet a full JEPA-AC/action-conditioned planner because there is no explicit commanded action token; the conditioning comes from observed hand-object interaction state.
-- Geometry is still the teacher; learned dynamics are not yet the sole source of physical truth.
-- The LLM refines semantic labels but does not own the metric scene state.
-
-Natural next steps:
-
-- Capture more Sophie-scene train/test clips with varied lighting, hand speed, viewpoint, and object pose.
-- Train on multiple clips and evaluate per-video generalization.
-- Add class-weighted contact loss and sweep horizon/learning rate/thresholds.
-- Decode future latent state into 3D object destination distributions.
-- Add explicit action/control tokens to move from interaction-conditioned prediction toward a JEPA-AC action-conditioned world model.
-- Move from one-step/short-horizon cues toward multi-step rollout over object/hand/target tokens.
-- Run A/B tests for DINO, FastSAM/YOLO segmentation, depth scaling, and temporal head thresholds.
-- Extend from observation/guidance to robot-task supervision: hand/object/target tokens become policy observations, and contact/release geometry becomes the teacher signal.
+Training is self-supervised from the grounded scene state. The geometry-based hand/object contact and release signals are accurate enough to act as a teacher, so the JEPA temporal head learns interaction dynamics from 3D contact/release episodes rather than from hand-written event labels. Geometry still provides the conservative physical state used for validation and safety, while JEPA learns to predict upcoming contact, release, destination, motion, and future latent state from those grounded episodes.
 
 ## Architecture
 

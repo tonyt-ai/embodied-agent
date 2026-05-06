@@ -1517,10 +1517,18 @@ class WorldState:
                 )
                 temporal_pred = self.temporal_head.predict(feat)
                 decoded_target = self._decode_temporal_target_from_motion(obj, temporal_pred)
+                temporal_target_label = str(temporal_pred.get("target_label", "target"))
+                decoded_target_score = float((decoded_target or {}).get("score", 0.0) or 0.0)
+                decoded_target_raw_label = str((decoded_target or {}).get("target_label") or "")
                 decoded_target_label = (
-                    decoded_target.get("target_label")
-                    if decoded_target is not None and float(decoded_target.get("score", 0.0) or 0.0) >= 0.15
-                    else str(temporal_pred.get("target_label", "target"))
+                    decoded_target_raw_label
+                    if decoded_target is not None
+                    and decoded_target_score >= 0.55
+                    and (
+                        self._canonical_support_label(decoded_target_raw_label) == self._canonical_support_label(temporal_target_label)
+                        or self._canonical_support_label(temporal_target_label) not in self._configured_transfer_targets()
+                    )
+                    else temporal_target_label
                 )
                 pred_future_latent = temporal_pred.get("future_latent", [])
                 obj_latent = obj.get("jepa_temporal_embedding", obj.get("jepa_embedding", []))
@@ -1739,7 +1747,12 @@ class WorldState:
                 (c for c in intent_candidates if str(c.get("object_id") or "") == str(nearest.get("object_id") or "")),
                 None,
             )
-            learned_source = grounded_temporal_candidate or {
+            # Once a learned manipulation episode has started, keep decoding its
+            # original object. The hand can pass near the other object or a static
+            # target during the transfer; those nearby rows should not steal the
+            # episode label, target, or release state.
+            learned_source_candidate = learned_candidate if learned_state is not None else grounded_temporal_candidate
+            learned_source = learned_source_candidate or grounded_temporal_candidate or {
                 "object_id": nearest.get("object_id"),
                 "label": self._interaction_display_label(self._find_object_by_id(nearest.get("object_id"), include_missing=True) or nearest, nearest.get("label", "object")),
                 "pred_contact_prob": float(nearest.get("temporal_pred", {}).get("contact_prob", 0.0) or 0.0),
@@ -1761,7 +1774,9 @@ class WorldState:
             learned_obj_id = str(learned_source.get("object_id") or "")
             learned_obj = self._find_object_by_id(learned_obj_id, include_missing=True)
             learned_label = self._interaction_display_label(learned_obj or learned_source, learned_source.get("label", "object"))
-            learned_target = str(self._persistent_transfer_target_for_object(learned_obj_id, learned_target) or learned_target)
+            persistent_target = str(self._persistent_transfer_target_for_object(learned_obj_id, learned_target) or "")
+            if self._canonical_support_label(learned_target) not in self._configured_transfer_targets() and persistent_target:
+                learned_target = persistent_target
             if learned_state is None and is_contacting and learned_contact_prob >= self.learned_contact_threshold:
                 learned_state = {
                     "hand_id": hand_id,

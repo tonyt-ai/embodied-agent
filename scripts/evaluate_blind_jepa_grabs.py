@@ -82,11 +82,15 @@ def target_from_bbox(row: dict) -> str:
         cy = (float(bbox[1]) + float(bbox[3])) * 0.5
     except (TypeError, ValueError):
         return ""
-    if 0.02 <= cx <= 0.47 and 0.12 <= cy <= 0.86:
-        return "mat"
-    if 0.48 <= cx <= 0.99 and 0.20 <= cy <= 0.98:
-        return "tray"
-    return ""
+    regions = [
+        ("tray", 0.31, 0.49, 0.36, 0.43),
+        ("mat", 0.73, 0.62, 0.34, 0.38),
+    ]
+    score, label = min(
+        (((cx - rx0) / max(rw, 1e-6)) ** 2 + ((cy - ry0) / max(rh, 1e-6)) ** 2, label)
+        for label, rx0, ry0, rw, rh in regions
+    )
+    return label if score <= 1.85 else ""
 
 
 def decode_events(
@@ -104,13 +108,14 @@ def decode_events(
             continue
         label = visual_label_from_row(row)
         learned_target = "tray" if float(target_prob) >= 0.5 else "mat"
-        target = target_from_bbox(row) or str(row.get("future_episode_target") or row.get("episode_target") or "") or learned_target
+        teacher_target = str(row.get("future_episode_target") or row.get("episode_target") or target_from_bbox(row) or "")
         events.append(
             {
                 "video_time_s": round(t, 3),
                 "prob": round(float(prob), 4),
                 "label": label,
-                "target": target,
+                "target": learned_target,
+                "teacher_target": teacher_target,
                 "target_tray_prob": round(float(target_prob), 4),
                 "object_id": row.get("object_id"),
             }
