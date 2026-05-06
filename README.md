@@ -11,7 +11,7 @@ Current demo shows JEPA prediction cues: the hand is holding Sophie the giraffe,
 
 ## What The System Contains
 
-The current design focuses on grounded interaction understanding and consists of several modules:
+The current design focuses on grounded interaction u  nderstanding and consists of several modules:
 
 - COLMAP sparse SfM for the offline/static scene prior.
 - Online sparse SLAM/PnP for camera motion and persistent map alignment during interaction.
@@ -108,7 +108,7 @@ Evaluate on the held-out test video:
 npm run jepa:sophie:test
 ```
 
-The shorter aliases still exist:
+Valid shorter aliases:
 
 ```bash
 npm run jepa:train
