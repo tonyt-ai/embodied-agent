@@ -12,7 +12,7 @@ static SfM/COLMAP prior -> online SLAM/depth -> persistent objects/targets
               -> Gemini labels/speech -> UI heatmaps/avatar feedback
 ```
 
-![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](/sophie_demo_prediction.jpg)
+![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction.jpg)
 
 Current Sophie demo overlay showing a JEPA prediction cue: the hand is tracking Sophie the giraffe, the destination heatmap is on the tray, and the UI surfaces the predicted target before the full demo is polished.
 
