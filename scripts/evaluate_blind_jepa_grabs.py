@@ -99,15 +99,33 @@ def decode_events(
     target_probs: np.ndarray,
     threshold: float,
     refractory_s: float,
+    target_tray_threshold: float,
+    peak_lookahead_s: float = 2.0,
 ) -> list[dict]:
     events = []
     last_t = -1e9
-    for row, prob, target_prob in zip(rows, probs, target_probs):
+    times = [float(row.get("video_time_s", row.get("frame", 0.0)) or 0.0) for row in rows]
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        prob = probs[i]
+        target_prob = target_probs[i]
         t = float(row.get("video_time_s", row.get("frame", 0.0)) or 0.0)
         if float(prob) < threshold or t - last_t < refractory_s:
+            i += 1
             continue
+        peak_candidates = [
+            j for j in range(i, len(rows))
+            if times[j] <= t + float(peak_lookahead_s)
+        ]
+        if peak_candidates:
+            i_peak = max(peak_candidates, key=lambda j: float(probs[j]))
+            row = rows[i_peak]
+            prob = probs[i_peak]
+            target_prob = target_probs[i_peak]
+            t = times[i_peak]
         label = visual_label_from_row(row)
-        learned_target = "tray" if float(target_prob) >= 0.5 else "mat"
+        learned_target = "tray" if float(target_prob) >= float(target_tray_threshold) else "mat"
         teacher_target = str(row.get("future_episode_target") or row.get("episode_target") or target_from_bbox(row) or "")
         events.append(
             {
@@ -121,6 +139,7 @@ def decode_events(
             }
         )
         last_t = t
+        i += 1
     return events
 
 
@@ -129,17 +148,21 @@ def main() -> None:
     parser.add_argument("--rows", default="world_model/data/temporal_head_train_rows_sophie.json")
     parser.add_argument("--model", default="world_model/models/temporal_interaction_head_sophie.pt")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--target-tray-threshold", type=float, default=0.45)
+    parser.add_argument("--peak-lookahead-s", type=float, default=2.0)
     parser.add_argument("--refractory-s", type=float, default=10.0)
     parser.add_argument("--output", default="world_model/data/blind_jepa_grabs_sophie_latest.json")
     args = parser.parse_args()
 
     rows = load_rows(REPO_ROOT / args.rows)
     probs, target_probs = predict_temporal(rows, REPO_ROOT / args.model)
-    events = decode_events(rows, probs, target_probs, threshold=args.threshold, refractory_s=args.refractory_s)
+    events = decode_events(rows, probs, target_probs, threshold=args.threshold, refractory_s=args.refractory_s, target_tray_threshold=args.target_tray_threshold, peak_lookahead_s=args.peak_lookahead_s)
     report = {
         "rows": len(rows),
         "model": args.model,
         "threshold": float(args.threshold),
+        "target_tray_threshold": float(args.target_tray_threshold),
+        "peak_lookahead_s": float(args.peak_lookahead_s),
         "refractory_s": float(args.refractory_s),
         "grab_count": len(events),
         "events": events,

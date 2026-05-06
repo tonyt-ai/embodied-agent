@@ -96,9 +96,9 @@ def _row_time(row: dict) -> float:
     return float(row.get("video_time_s", row.get("frame", 0.0)) or 0.0)
 
 
-def _event_from_row(row: dict, prob: float, target_prob: float) -> dict:
+def _event_from_row(row: dict, prob: float, target_prob: float, target_tray_threshold: float = 0.45) -> dict:
     label = visual_label_from_row(row)
-    learned_target = "tray" if float(target_prob) >= 0.5 else "mat"
+    learned_target = "tray" if float(target_prob) >= float(target_tray_threshold) else "mat"
     teacher_target = str(row.get("future_episode_target") or row.get("episode_target") or target_from_bbox(row) or "")
     return {
         "video_time_s": round(_row_time(row), 3),
@@ -111,14 +111,14 @@ def _event_from_row(row: dict, prob: float, target_prob: float) -> dict:
     }
 
 
-def decode_threshold_events(rows: list[dict], probs: np.ndarray, target_probs: np.ndarray, threshold: float, refractory_s: float) -> list[dict]:
+def decode_threshold_events(rows: list[dict], probs: np.ndarray, target_probs: np.ndarray, threshold: float, refractory_s: float, target_tray_threshold: float) -> list[dict]:
     events = []
     last_t = -1e9
     for row, prob, target_prob in zip(rows, probs, target_probs):
         t = _row_time(row)
         if float(prob) < threshold or t - last_t < refractory_s:
             continue
-        events.append(_event_from_row(row, float(prob), float(target_prob)))
+        events.append(_event_from_row(row, float(prob), float(target_prob), target_tray_threshold=target_tray_threshold))
         last_t = t
     return events
 
@@ -133,6 +133,8 @@ def decode_stateful_events(
     grab_refractory_s: float,
     min_hold_s: float,
     pre_next_grab_margin_s: float,
+    target_tray_threshold: float,
+    peak_lookahead_s: float,
 ) -> list[dict]:
     """Decode one learned release inside each learned hold episode.
 
@@ -140,7 +142,17 @@ def decode_stateful_events(
     hand-object episode. The contact head opens the episode, the release head
     chooses the most plausible closing moment before the next learned grab.
     """
-    grabs = decode_threshold_events(rows, contact_probs, target_probs, contact_threshold, grab_refractory_s)
+    from evaluate_blind_jepa_grabs import decode_events as decode_grab_events
+
+    grabs = decode_grab_events(
+        rows,
+        contact_probs,
+        target_probs,
+        threshold=contact_threshold,
+        refractory_s=grab_refractory_s,
+        target_tray_threshold=target_tray_threshold,
+        peak_lookahead_s=peak_lookahead_s,
+    )
     times = np.asarray([_row_time(row) for row in rows], dtype=np.float32)
     events = []
     for i, grab in enumerate(grabs):
@@ -151,6 +163,20 @@ def decode_stateful_events(
         idx = np.where((times >= start_t) & (times <= end_t))[0]
         if len(idx) == 0:
             continue
+        grab_object_id = str(grab.get("object_id") or "")
+        grab_label = canonical_label(str(grab.get("label") or ""))
+        same_object_idx = [
+            int(j) for j in idx
+            if grab_object_id and str(rows[int(j)].get("object_id") or "") == grab_object_id
+        ]
+        same_label_idx = [
+            int(j) for j in idx
+            if canonical_label(str(rows[int(j)].get("visual_identity_label") or rows[int(j)].get("object_label") or "")) == grab_label
+        ]
+        if same_object_idx:
+            idx = np.asarray(same_object_idx, dtype=np.int64)
+        elif same_label_idx:
+            idx = np.asarray(same_label_idx, dtype=np.int64)
         above = idx[release_probs[idx] >= float(release_threshold)]
         if len(above) > 0:
             # Use the first confident release so the event is timely, not merely
@@ -158,7 +184,7 @@ def decode_stateful_events(
             chosen = int(above[0])
         else:
             chosen = int(idx[np.argmax(release_probs[idx])])
-        event = _event_from_row(rows[chosen], float(release_probs[chosen]), float(target_probs[chosen]))
+        event = _event_from_row(rows[chosen], float(release_probs[chosen]), float(target_probs[chosen]), target_tray_threshold=target_tray_threshold)
         event["grab_time_s"] = round(float(grab["video_time_s"]), 3)
         event["grab_prob"] = grab["prob"]
         event["fallback_peak"] = bool(len(above) == 0)
@@ -171,6 +197,8 @@ def main() -> None:
     parser.add_argument("--rows", default="world_model/data/temporal_head_train_rows_sophie.json")
     parser.add_argument("--model", default="world_model/models/temporal_interaction_head_sophie.pt")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--target-tray-threshold", type=float, default=0.45)
+    parser.add_argument("--peak-lookahead-s", type=float, default=2.0)
     parser.add_argument("--refractory-s", type=float, default=5.0)
     parser.add_argument("--mode", choices=["stateful", "threshold"], default="stateful")
     parser.add_argument("--contact-threshold", type=float, default=0.5)
@@ -192,9 +220,11 @@ def main() -> None:
             grab_refractory_s=args.refractory_s,
             min_hold_s=args.min_hold_s,
             pre_next_grab_margin_s=args.pre_next_grab_margin_s,
+            target_tray_threshold=args.target_tray_threshold,
+            peak_lookahead_s=args.peak_lookahead_s,
         )
     else:
-        events = decode_threshold_events(rows, release_probs, target_probs, threshold=args.threshold, refractory_s=args.refractory_s)
+        events = decode_threshold_events(rows, release_probs, target_probs, threshold=args.threshold, refractory_s=args.refractory_s, target_tray_threshold=args.target_tray_threshold)
     report = {
         "rows": len(rows),
         "model": args.model,
@@ -202,6 +232,8 @@ def main() -> None:
         "threshold": float(args.threshold),
         "refractory_s": float(args.refractory_s),
         "contact_threshold": float(args.contact_threshold),
+        "target_tray_threshold": float(args.target_tray_threshold),
+        "peak_lookahead_s": float(args.peak_lookahead_s),
         "release_count": len(events),
         "events": events,
     }

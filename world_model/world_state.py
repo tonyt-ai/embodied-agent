@@ -1514,10 +1514,15 @@ class WorldState:
                     float(hand_speed),
                     float(obj_speed),
                     int(hand.get("contact_streak", 0)),
+                    obj_pos_3d=obj.get("position_3d", [0.0, 0.0, 0.0]),
+                    bbox=obj.get("bbox", []),
+                    support_label=obj.get("support_target_label", ""),
                 )
                 temporal_pred = self.temporal_head.predict(feat)
                 decoded_target = self._decode_temporal_target_from_motion(obj, temporal_pred)
                 temporal_target_label = str(temporal_pred.get("target_label", "target"))
+                temporal_target_prob = float(temporal_pred.get("target_tray_prob", 0.5) or 0.5)
+                temporal_target_threshold = float(temporal_pred.get("target_tray_threshold", 0.45) or 0.45)
                 decoded_target_score = float((decoded_target or {}).get("score", 0.0) or 0.0)
                 decoded_target_raw_label = str((decoded_target or {}).get("target_label") or "")
                 decoded_target_label = (
@@ -1530,6 +1535,13 @@ class WorldState:
                     )
                     else temporal_target_label
                 )
+                persistent_target = str(self._persistent_transfer_target_for_object(str(obj.get("id") or ""), decoded_target_label) or "")
+                target_is_uncertain = abs(temporal_target_prob - temporal_target_threshold) <= 0.16
+                if (
+                    target_is_uncertain
+                    and self._canonical_support_label(persistent_target) in self._configured_transfer_targets()
+                ):
+                    decoded_target_label = persistent_target
                 pred_future_latent = temporal_pred.get("future_latent", [])
                 obj_latent = obj.get("jepa_temporal_embedding", obj.get("jepa_embedding", []))
                 latent_conf = 0.0

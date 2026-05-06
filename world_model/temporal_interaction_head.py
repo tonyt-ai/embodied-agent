@@ -43,9 +43,29 @@ def build_feature_vector(
     hand_speed_m: float,
     obj_speed_m: float,
     contact_streak: int,
+    obj_pos_3d: List[float] | None = None,
+    bbox: List[float] | None = None,
+    support_label: str = "",
 ) -> np.ndarray:
     h = _pad(hand_emb, EMB_DIM)
     o = _pad(obj_emb, EMB_DIM)
+    pos = _pad(obj_pos_3d or [], 3)
+    box = _pad(bbox or [], 4)
+    if box.size >= 4:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        box_geom = np.asarray([
+            (x1 + x2) * 0.5,
+            (y1 + y2) * 0.5,
+            max(0.0, x2 - x1),
+            max(0.0, y2 - y1),
+        ], dtype=np.float32)
+    else:
+        box_geom = np.zeros((4,), dtype=np.float32)
+    support = str(support_label or "").strip().lower().replace("_", " ")
+    support_geom = np.asarray([
+        1.0 if support in {"mat", "black mat", "table mat", "placemat", "dish", "plate"} else 0.0,
+        1.0 if support in {"tray", "plastic tray", "white tray"} else 0.0,
+    ], dtype=np.float32)
     g = np.asarray(
         [
             float(distance_m),
@@ -57,11 +77,11 @@ def build_feature_vector(
         ],
         dtype=np.float32,
     )
-    return np.concatenate([h, o, g], axis=0)
+    return np.concatenate([h, o, g, pos, box_geom, support_geom], axis=0)
 
 
 class TemporalInteractionHead(nn.Module):
-    def __init__(self, in_dim: int = EMB_DIM * 2 + 6, hidden: int = 128):
+    def __init__(self, in_dim: int = EMB_DIM * 2 + 15, hidden: int = 128):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -99,12 +119,17 @@ class TemporalInteractionPredictor:
         )
         self.contact_threshold = float(os.environ.get("TEMPORAL_HEAD_CONTACT_THRESHOLD", "0.20"))
         self.placement_threshold = float(os.environ.get("TEMPORAL_HEAD_PLACEMENT_THRESHOLD", "0.45"))
+        self.target_tray_threshold = float(os.environ.get("TEMPORAL_HEAD_TARGET_TRAY_THRESHOLD", "0.45"))
         self.model = None
         if not self.enabled or torch is None or nn is None:
             return
-        self.model = TemporalInteractionHead().to(self.device)
         if os.path.isfile(self.model_path):
             state = torch.load(self.model_path, map_location=self.device)
+            in_dim = EMB_DIM * 2 + 15
+            first_weight = state.get("trunk.0.weight") if isinstance(state, dict) else None
+            if first_weight is not None and hasattr(first_weight, "shape") and len(first_weight.shape) == 2:
+                in_dim = int(first_weight.shape[1])
+            self.model = TemporalInteractionHead(in_dim=in_dim).to(self.device)
             self.model.load_state_dict(state, strict=False)
             self.model.eval()
             self.ready = True
@@ -122,13 +147,20 @@ class TemporalInteractionPredictor:
                 "release_signal": False,
                 "contact_threshold": float(self.contact_threshold),
                 "placement_threshold": float(self.placement_threshold),
+                "target_tray_threshold": float(self.target_tray_threshold),
                 "motion_dx": 0.0,
                 "motion_dy": 0.0,
                 "motion_dz": 0.0,
                 "source": "disabled",
             }
         with torch.no_grad():
-            x = torch.from_numpy(feat.astype(np.float32)).unsqueeze(0).to(self.device)
+            feat_arr = feat.astype(np.float32)
+            expected_dim = int(self.model.trunk[0].in_features)
+            if feat_arr.shape[0] < expected_dim:
+                feat_arr = np.pad(feat_arr, (0, expected_dim - feat_arr.shape[0]))
+            elif feat_arr.shape[0] > expected_dim:
+                feat_arr = feat_arr[:expected_dim]
+            x = torch.from_numpy(feat_arr).unsqueeze(0).to(self.device)
             out = self.model(x)
             contact_prob = torch.sigmoid(out["contact_logit"])[0, 0].item()
             place_prob = torch.sigmoid(out["placement_logit"])[0, 0].item()
@@ -141,12 +173,13 @@ class TemporalInteractionPredictor:
             "placement_prob": float(place_prob),
             "release_prob": float(release_prob),
             "target_tray_prob": float(target_tray_prob),
-            "target_label": "tray" if target_tray_prob >= 0.5 else "mat",
+            "target_label": "tray" if target_tray_prob >= self.target_tray_threshold else "mat",
             "contact_signal": bool(contact_prob >= self.contact_threshold),
             "placement_signal": bool(place_prob >= self.placement_threshold),
             "release_signal": bool(release_prob >= self.placement_threshold),
             "contact_threshold": float(self.contact_threshold),
             "placement_threshold": float(self.placement_threshold),
+            "target_tray_threshold": float(self.target_tray_threshold),
             "motion_dx": float(md[0]),
             "motion_dy": float(md[1]),
             "motion_dz": float(md[2]),

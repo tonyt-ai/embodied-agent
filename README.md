@@ -127,6 +127,8 @@ Current Sophie demo defaults use the temporal head as an early learned attention
 ```text
 TEMPORAL_HEAD_CONTACT_THRESHOLD=0.20
 TEMPORAL_HEAD_PLACEMENT_THRESHOLD=0.45
+TEMPORAL_HEAD_TARGET_TRAY_THRESHOLD=0.45
+JEPA_EVENT_RELEASE_UI_THRESHOLD=0.35
 ```
 
 Training is self-supervised from the grounded scene state. The geometry-based hand/object contact and release signals are accurate enough to act as a teacher, so the JEPA temporal head learns interaction dynamics from 3D contact/release episodes rather than from hand-written event labels. Geometry still provides the conservative physical state used for validation and safety, while JEPA learns to predict upcoming contact, release, destination, motion, and future latent state from those grounded episodes.

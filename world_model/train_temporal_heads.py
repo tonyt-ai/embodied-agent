@@ -227,7 +227,14 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
     for i, row in enumerate(rows):
         label = _visual_episode_label(row)
         is_movable = label in {"baby bottle", "toy giraffe", "bottle", "cup", "toy"}
-        is_contact = bool(row.get("is_contacting", False)) and is_movable
+        try:
+            effective_distance = float(row.get("effective_distance_m", row.get("distance_m", 9.0)) or 9.0)
+            distance_m = float(row.get("distance_m", effective_distance) or effective_distance)
+        except (TypeError, ValueError):
+            effective_distance = 9.0
+            distance_m = 9.0
+        strict_or_close = bool(row.get("is_touching_strict", False)) or effective_distance <= 0.105 or distance_m <= 0.12
+        is_contact = bool(row.get("is_contacting", False)) and is_movable and strict_or_close
         support = normalize_label(row.get("source_support_label", ""))
         source_region = _sophie_region_label_from_bbox(row.get("bbox"))
         target = _target_label_for_support(source_region or support)
@@ -252,6 +259,7 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
                     "targets": {},
                     "regions": [],
                     "contact_rows": 0,
+                    "object_ids": {},
                 }
             elif last_contact_i is not None and i - last_contact_i > max(1, int(gap_rows)):
                 active["end"] = last_contact_i
@@ -265,12 +273,16 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
                     "targets": {},
                     "regions": [],
                     "contact_rows": 0,
+                    "object_ids": {},
                 }
             active["last"] = i
             active["last_label"] = label
             active["end"] = i
             active["contact_rows"] += 1
             active["labels"][label] = active["labels"].get(label, 0) + 1
+            object_id = str(row.get("object_id") or "")
+            if object_id:
+                active["object_ids"][object_id] = active["object_ids"].get(object_id, 0) + 1
             current_region = source_region or support
             if current_region in {"mat", "tray"}:
                 active["regions"].append(current_region)
@@ -287,22 +299,106 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
         episodes.append(active)
 
     stable = []
-    for ep in episodes:
-        if int(ep.get("contact_rows", 0)) < max(1, int(min_contact_rows)):
-            continue
-        label = max(ep["labels"].items(), key=lambda kv: kv[1])[0] if ep.get("labels") else "object"
-        regions = list(ep.get("regions") or [])
-        tail = regions[max(0, len(regions) // 2):] if regions else []
-        if tail:
-            target = max({r: tail.count(r) for r in set(tail)}.items(), key=lambda kv: kv[1])[0]
-        elif regions:
-            source = regions[0]
-            target = _target_label_for_support(source) or ""
-        else:
-            target = max(ep["targets"].items(), key=lambda kv: kv[1])[0] if ep.get("targets") else ""
-        ep["label"] = label
-        ep["target"] = target
-        stable.append(ep)
+    if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie":
+        physical_clusters = []
+        current = []
+        last_t = None
+        for i, row in enumerate(rows):
+            label = _visual_episode_label(row)
+            if label not in {"baby bottle", "toy giraffe", "bottle", "cup", "toy"}:
+                continue
+            try:
+                t = float(row.get("video_time_s", 0.0) or 0.0)
+                effective_distance = float(row.get("effective_distance_m", row.get("distance_m", 9.0)) or 9.0)
+                distance_m = float(row.get("distance_m", effective_distance) or effective_distance)
+            except (TypeError, ValueError):
+                continue
+            strict_or_close = bool(row.get("is_touching_strict", False)) or effective_distance <= 0.105 or distance_m <= 0.12
+            if not (bool(row.get("is_contacting", False)) and strict_or_close):
+                continue
+            if current and last_t is not None and t - last_t > 0.95:
+                physical_clusters.append(current)
+                current = []
+            current.append(i)
+            last_t = t
+        if current:
+            physical_clusters.append(current)
+
+        for cluster in physical_clusters:
+            by_object = {}
+            for i in cluster:
+                row = rows[i]
+                label = _visual_episode_label(row)
+                object_id = str(row.get("object_id") or "")
+                key = object_id or label
+                if not key:
+                    continue
+                feat = row.get("feat") if isinstance(row.get("feat"), list) else []
+                try:
+                    obj_speed = float(feat[132]) if len(feat) > 132 else 0.0
+                    effective_distance = float(row.get("effective_distance_m", row.get("distance_m", 9.0)) or 9.0)
+                except (TypeError, ValueError):
+                    obj_speed = 0.0
+                    effective_distance = 9.0
+                item = by_object.setdefault(key, {
+                    "indices": [],
+                    "labels": {},
+                    "regions": [],
+                    "score": 0.0,
+                    "object_id": object_id,
+                })
+                item["indices"].append(i)
+                item["labels"][label] = item["labels"].get(label, 0) + 1
+                region = _sophie_region_label_from_bbox(row.get("bbox"))
+                if region in {"mat", "tray"}:
+                    item["regions"].append(region)
+                item["score"] += 0.05
+                item["score"] += min(max(obj_speed, 0.0), 0.5) * 5.0
+                item["score"] += 0.8 if bool(row.get("is_touching_strict", False)) else 0.0
+                item["score"] += max(0.0, 0.12 - effective_distance) * 2.0
+            if not by_object:
+                continue
+            owner = max(by_object.values(), key=lambda item: item["score"])
+            if len(owner["indices"]) < max(1, int(min_contact_rows)):
+                continue
+            label = max(owner["labels"].items(), key=lambda kv: kv[1])[0] if owner.get("labels") else "object"
+            if label not in {"baby bottle", "toy giraffe"}:
+                continue
+            regions = list(owner.get("regions") or [])
+            source = regions[0] if regions else ""
+            target = _target_label_for_support(source)
+            if not target and regions:
+                tail = regions[max(0, len(regions) // 2):]
+                target = max({r: tail.count(r) for r in set(tail)}.items(), key=lambda kv: kv[1])[0]
+            stable.append({
+                "start": min(owner["indices"]),
+                "end": max(owner["indices"]),
+                "label": label,
+                "target": target,
+                "object_ids": {owner.get("object_id", ""): len(owner["indices"])},
+            })
+
+    if not stable:
+        for ep in episodes:
+            if int(ep.get("contact_rows", 0)) < max(1, int(min_contact_rows)):
+                continue
+            label = max(ep["labels"].items(), key=lambda kv: kv[1])[0] if ep.get("labels") else "object"
+            if ep.get("object_ids"):
+                dominant_object_count = max(ep["object_ids"].values())
+                if dominant_object_count / max(1, int(ep.get("contact_rows", 0))) < 0.62:
+                    continue
+            regions = list(ep.get("regions") or [])
+            tail = regions[max(0, len(regions) // 2):] if regions else []
+            if tail:
+                target = max({r: tail.count(r) for r in set(tail)}.items(), key=lambda kv: kv[1])[0]
+            elif regions:
+                source = regions[0]
+                target = _target_label_for_support(source) or ""
+            else:
+                target = max(ep["targets"].items(), key=lambda kv: kv[1])[0] if ep.get("targets") else ""
+            ep["label"] = label
+            ep["target"] = target
+            stable.append(ep)
 
     for row in rows:
         row.pop("episode_id", None)
@@ -472,7 +568,14 @@ def build_release_target_events(events, cluster_gap_s=4.0):
         if not moved or move_distance < 0.05 or not support_ok:
             continue
         score = (2.0 * move_distance) + (0.25 * support_score) + (2.0 * overlap)
-        candidates.append({"time": t, "target": target, "score": float(score), "event": ev})
+        candidates.append({
+            "time": t,
+            "target": target,
+            "label": _episode_label(ev.get("label", "")),
+            "object_id": str(ev.get("object_id") or ""),
+            "score": float(score),
+            "event": ev,
+        })
     candidates.sort(key=lambda item: item["time"])
     clusters = []
     cur = []
@@ -496,6 +599,8 @@ def build_release_target_events(events, cluster_gap_s=4.0):
         out.append({
             "time": float(best["time"]),
             "target": target,
+            "label": best.get("label", ""),
+            "object_id": best.get("object_id", ""),
             "score": float(best["score"]),
             "cluster_size": int(len(cluster)),
         })
@@ -503,7 +608,13 @@ def build_release_target_events(events, cluster_gap_s=4.0):
 
 
 def add_release_target_supervision(rows, release_events, lookback_s=14.0, lookahead_s=2.0):
-    """Use future grounded release/support events to supervise mat/tray target."""
+    """Use future grounded release/support events to supervise mat/tray target.
+
+    Release events are noisy in this webcam setup, so never let one object's
+    release globally relabel every candidate row in the same time window. The
+    event must match the row's visual identity, and object ids are used when the
+    tracker keeps them stable.
+    """
     releases = build_release_target_events(release_events)
     if not releases:
         return rows
@@ -512,9 +623,15 @@ def add_release_target_supervision(rows, release_events, lookback_s=14.0, lookah
             t = float(row.get("video_time_s", 0.0) or 0.0)
         except (TypeError, ValueError):
             continue
+        row_label = _visual_episode_label(row)
+        row_object_id = str(row.get("object_id") or "")
         future = [
             ev for ev in releases
             if t - float(lookahead_s) <= ev["time"] <= t + float(lookback_s)
+            and (
+                (row_object_id and ev.get("object_id") and row_object_id == ev.get("object_id"))
+                or (row_label and ev.get("label") and row_label == ev.get("label"))
+            )
         ]
         if not future:
             continue
@@ -673,6 +790,9 @@ def collect_examples(video_path: str, horizon: int = 10):
                 hand_speed,
                 obj_speed,
                 int(hand.get("contact_streak", 0)),
+                obj_pos_3d=obj.get("position_3d", [0.0, 0.0, 0.0]),
+                bbox=obj.get("bbox", []),
+                support_label=it.get("source_support_label") or obj.get("support_target_label", ""),
             )
             rows.append({
                 "frame": len(rows),
@@ -686,6 +806,10 @@ def collect_examples(video_path: str, horizon: int = 10):
                 "bbox": obj.get("bbox", []),
                 "feat": feat.tolist(),
                 "is_contacting": bool(it.get("is_contacting", False)),
+                "is_touching_strict": bool(it.get("is_touching_strict", False)),
+                "distance_m": float(it.get("distance_m", 9.0) or 9.0),
+                "effective_distance_m": float(it.get("effective_distance_m", it.get("distance_m", 9.0)) or 9.0),
+                "penetration_m": float(it.get("penetration_m", 0.0) or 0.0),
                 "obj_pos": obj.get("position_3d", [0.0, 0.0, 0.0]),
                 "obj_emb": obj.get("jepa_temporal_embedding", obj.get("jepa_embedding", [])),
             })
