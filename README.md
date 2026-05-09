@@ -7,7 +7,7 @@ The system watches the scene from an egocentric video, builds a persistent 3D sc
 
 ![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction1s.gif)
 
-Current demo shows JEPA prediction cues: the hand is holding a baby bottle, the destination heatmap is on the tray, and the UI shows the predicted target.
+Current demo shows JEPA prediction cues: the hand is holding a baby bottle, the destination heatmap is on the tray, and the UI shows the predicted target. A live avatar connected to an LLM (not shown here) communicates the outcome.
 
 ## What The System Contains
 
