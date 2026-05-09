@@ -5,7 +5,7 @@ A real-time, 3D grounded world model demo for egocentric assisted-living tasks w
 The current repository showcases hand-object interactions in a real-world environment, observed by an embodied AI agent.
 The system watches the scene from an egocentric video, builds a persistent 3D scene prior, tracks hands and objects online, predicts likely interaction futures and targets, asks an LLM (Gemini) to refine weak object labels, and speaks timely guidance through a live avatar.
 
-![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction.jpg)
+![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction1.gif)
 
 Current demo shows JEPA prediction cues: the hand is holding Sophie the giraffe, the destination heatmap is on the tray, and the UI shows the predicted target.
 
