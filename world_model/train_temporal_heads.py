@@ -39,6 +39,11 @@ from temporal_interaction_head import TemporalInteractionHead, build_feature_vec
 from world_state import WorldState
 from ultralytics import YOLO
 
+try:
+    from dino_encoder import encode_bbox as encode_dino_bbox
+except Exception:
+    encode_dino_bbox = None
+
 
 def _resolve_model(path: str) -> Path:
     p = Path(path)
@@ -87,6 +92,96 @@ MOVABLE_EPISODE_LABELS = {
     "mouse",
 }
 
+DINO_STATE_DIM = 32
+
+
+def _bbox_area_norm(bbox) -> float:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return 0.0
+    try:
+        return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _nonzero_embedding(emb) -> bool:
+    if not isinstance(emb, list) or not emb:
+        return False
+    try:
+        return any(abs(float(v)) > 1e-8 for v in emb)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cosine_embedding(a, b) -> float:
+    if not isinstance(a, list) or not isinstance(b, list) or not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    try:
+        av = np.asarray(a[:n], dtype=np.float32)
+        bv = np.asarray(b[:n], dtype=np.float32)
+        denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
+        if denom <= 1e-8:
+            return 0.0
+        return float(np.clip(np.dot(av, bv) / denom, -1.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _encode_dino_identity(frame, bbox, *, out_dim=DINO_STATE_DIM):
+    if encode_dino_bbox is None:
+        return []
+    if _bbox_area_norm(bbox) <= 0.0:
+        return []
+    try:
+        emb = encode_dino_bbox(frame, bbox, out_dim=out_dim)
+    except Exception:
+        return []
+    return emb if _nonzero_embedding(emb) else []
+
+
+def _sophie_identity_prototypes(world_state: WorldState) -> dict[str, list[float]]:
+    if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() != "sophie":
+        return {}
+    prototypes: dict[str, list[list[float]]] = {}
+    for obj in getattr(world_state, "objects", {}).values():
+        label = normalize_label(
+            obj.get("scene_memory_label")
+            or obj.get("semantic_label")
+            or obj.get("label")
+            or obj.get("raw_label")
+            or ""
+        )
+        visual = str(obj.get("visual_identity_class") or "").strip().lower()
+        if visual == "baby_bottle":
+            label = "baby bottle"
+        elif visual == "toy_giraffe":
+            label = "toy giraffe"
+        if label not in {"baby bottle", "toy giraffe"}:
+            continue
+        emb = obj.get("dino_embedding") or (obj.get("embedding") if str(obj.get("embedding_source", "")).lower() == "dino" else [])
+        if _nonzero_embedding(emb):
+            prototypes.setdefault(label, []).append(emb)
+    out = {}
+    for label, embeds in prototypes.items():
+        arrs = []
+        for emb in embeds[-8:]:
+            try:
+                arr = np.asarray(emb, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                if norm > 1e-8:
+                    arrs.append(arr / norm)
+            except Exception:
+                continue
+        if arrs:
+            proto = np.mean(np.stack(arrs, axis=0), axis=0)
+            norm = float(np.linalg.norm(proto))
+            if norm > 1e-8:
+                out[label] = (proto / norm).astype(np.float32).tolist()
+    return out
+
 
 def _target_label_for_support(label: str) -> str:
     norm = normalize_label(label)
@@ -122,6 +217,52 @@ def _sophie_region_label_from_bbox(bbox) -> str:
         scored.append((score, label))
     score, label = min(scored, key=lambda item: item[0])
     return label if score <= 1.85 else ""
+
+
+def _grounded_source_region(row: dict) -> str:
+    """Prefer persistent support memory; keep the Sophie bbox as a weak fallback."""
+    if not isinstance(row, dict):
+        return ""
+    support = normalize_label(row.get("source_support_label", ""))
+    if support in {"mat", "tray"}:
+        return support
+    support = normalize_label(row.get("support_target_label", ""))
+    if support in {"mat", "tray"}:
+        return support
+    return _sophie_region_label_from_bbox(row.get("bbox"))
+
+
+def _infer_grounded_support_label(world_state, object_id: str, obj: dict, fallback: str = "") -> str:
+    label = normalize_label(fallback)
+    if label in {"mat", "tray"}:
+        return label
+    if not isinstance(obj, dict):
+        return ""
+    try:
+        relation = world_state._find_place_relation(
+            object_id,
+            world_state._as_vec3(obj.get("position_camera_3d")),
+            object_bbox=obj.get("bbox"),
+        )
+        if relation and world_state._support_relation_confident(relation):
+            label = normalize_label(relation.get("nearest_object_label", ""))
+            if label in {"mat", "tray"}:
+                return label
+    except Exception:
+        pass
+    try:
+        nearest = world_state._find_best_static_target(None, object_bbox=obj.get("bbox"))
+        if nearest and (
+            bool(nearest.get("bbox_center_inside", False))
+            or float(nearest.get("bbox_overlap", 0.0) or 0.0) >= 0.04
+            or float(nearest.get("support_score", 0.0) or 0.0) >= 1.35
+        ):
+            label = normalize_label(nearest.get("label", ""))
+            if label in {"mat", "tray"}:
+                return label
+    except Exception:
+        pass
+    return _sophie_region_label_from_bbox(obj.get("bbox"))
 
 
 def _episode_label(label: str) -> str:
@@ -235,9 +376,8 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
             distance_m = 9.0
         strict_or_close = bool(row.get("is_touching_strict", False)) or effective_distance <= 0.105 or distance_m <= 0.12
         is_contact = bool(row.get("is_contacting", False)) and is_movable and strict_or_close
-        support = normalize_label(row.get("source_support_label", ""))
-        source_region = _sophie_region_label_from_bbox(row.get("bbox"))
-        target = _target_label_for_support(source_region or support)
+        source_region = _grounded_source_region(row)
+        target = _target_label_for_support(source_region)
         if is_contact:
             should_split_label = (
                 active is not None
@@ -283,7 +423,7 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
             object_id = str(row.get("object_id") or "")
             if object_id:
                 active["object_ids"][object_id] = active["object_ids"].get(object_id, 0) + 1
-            current_region = source_region or support
+            current_region = source_region
             if current_region in {"mat", "tray"}:
                 active["regions"].append(current_region)
             if target:
@@ -349,7 +489,7 @@ def add_episode_targets(rows, horizon=10, min_contact_rows=4, gap_rows=8):
                 })
                 item["indices"].append(i)
                 item["labels"][label] = item["labels"].get(label, 0) + 1
-                region = _sophie_region_label_from_bbox(row.get("bbox"))
+                region = _grounded_source_region(row)
                 if region in {"mat", "tray"}:
                     item["regions"].append(region)
                 item["score"] += 0.05
@@ -473,7 +613,7 @@ def refresh_episode_future_targets(rows, horizon=10):
             row["future_episode_label"] = future_episode.get("episode_label", "")
             row["future_episode_target"] = future_episode.get("episode_target", "")
         elif not row.get("future_episode_target"):
-            source_region = _sophie_region_label_from_bbox(row.get("bbox"))
+            source_region = _grounded_source_region(row)
             target = _target_label_for_support(source_region)
             if target:
                 row["future_episode_target"] = target
@@ -513,7 +653,7 @@ def add_snapshot_target_supervision(rows, snapshots, horizon=10, settle_window_s
             except (TypeError, ValueError):
                 continue
             if ep["end_t"] - 0.25 <= t <= ep["end_t"] + float(settle_window_s):
-                region = _sophie_region_label_from_bbox(snap.get("bbox"))
+                region = _grounded_source_region(snap)
                 if region in {"mat", "tray"}:
                     regions.append(region)
         if not regions:
@@ -615,6 +755,11 @@ def add_release_target_supervision(rows, release_events, lookback_s=14.0, lookah
     event must match the row's visual identity, and object ids are used when the
     tracker keeps them stable.
     """
+    if (
+        os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie"
+        and os.environ.get("SOPHIE_USE_RELEASE_TARGET_TEACHER", "0").strip().lower() not in {"1", "true", "yes"}
+    ):
+        return rows
     releases = build_release_target_events(release_events)
     if not releases:
         return rows
@@ -725,6 +870,12 @@ def collect_examples(video_path: str, horizon: int = 10):
             unmatched_max_area=0.30,
             unmatched_max_items=8,
         )
+        dino_reid_enabled = (
+            encode_dino_bbox is not None
+            and os.environ.get("USE_DINO_EMBEDDING", "1").lower() in {"1", "true", "yes"}
+            and os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie"
+        )
+        dino_prototypes = _sophie_identity_prototypes(world_state) if dino_reid_enabled else {}
         for candidate in candidates:
             conf = float(candidate.get("confidence", 0.0) or 0.0)
             if conf < 0.12:
@@ -737,6 +888,25 @@ def collect_examples(video_path: str, horizon: int = 10):
             if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
                 continue
             bbox = [float(v) for v in bbox]
+            dino_emb = []
+            visual_identity_label = ""
+            visual_identity_score = 0.0
+            visual_identity_margin = 0.0
+            if dino_reid_enabled and label not in {
+                "tray", "mat", "black mat", "table mat", "placemat", "dish", "plate"
+            } and 0.001 <= _bbox_area_norm(bbox) <= 0.34:
+                dino_emb = _encode_dino_identity(frame, bbox)
+                if dino_emb and dino_prototypes:
+                    sims = {name: _cosine_embedding(dino_emb, proto) for name, proto in dino_prototypes.items()}
+                    if sims:
+                        best_label, best_sim = max(sims.items(), key=lambda kv: kv[1])
+                        other = max([v for k, v in sims.items() if k != best_label] or [0.0])
+                        margin = float(best_sim) - float(other)
+                        if best_sim >= 0.70 and margin >= 0.04:
+                            label = best_label
+                            visual_identity_label = best_label
+                            visual_identity_score = float(best_sim)
+                            visual_identity_margin = float(margin)
             lifted = lift_bbox_to_3d(bbox, depth_map, pose, intr, sparse_points=pose.get("sparse_map", []))
             item = {
                 "label": label,
@@ -747,11 +917,19 @@ def collect_examples(video_path: str, horizon: int = 10):
                 "y": float((bbox[1] + bbox[3]) * 0.5),
                 "position_3d": lifted.get("position_world_3d", [0.0, 0.0, 0.0]),
                 "position_camera_3d": lifted.get("position_camera_3d", [0.0, 0.0, 0.0]),
-                "embedding": [0.0] * 32,
+                "embedding": dino_emb if dino_emb else [0.0] * DINO_STATE_DIM,
+                "embedding_source": "dino" if dino_emb else "none",
+                "dino_embedding": dino_emb,
                 "jepa_embedding": jepa.encode_bbox(frame, bbox) if jepa.ready else [],
                 "mask_polygon": candidate.get("mask_polygon"),
                 "segmentation_source": candidate.get("segmentation_source", "bbox"),
             }
+            if visual_identity_label:
+                item["semantic_label"] = visual_identity_label
+                item["visual_identity_label"] = visual_identity_label
+                item["visual_identity_score"] = round(visual_identity_score, 4)
+                item["visual_identity_margin"] = round(visual_identity_margin, 4)
+                item["visual_identity_class"] = "baby_bottle" if visual_identity_label == "baby bottle" else "toy_giraffe"
             detections.append(item)
             if label in MOVABLE_EPISODE_LABELS:
                 object_snapshots.append({
@@ -767,7 +945,13 @@ def collect_examples(video_path: str, horizon: int = 10):
             hbbox = _bbox_from_hand_landmarks(hand.get("landmarks_px"), frame.shape[:2])
             hand["jepa_embedding"] = jepa.encode_bbox(frame, hbbox) if (jepa.ready and hbbox is not None) else []
 
-        world_state.update(detections, camera_pose=pose, hands=hands, world_debug={}, sparse_map=pose.get("sparse_map", []))
+        world_state.update(
+            detections,
+            camera_pose=pose,
+            hands=hands,
+            world_debug={"intrinsics": intr},
+            sparse_map=pose.get("sparse_map", []),
+        )
         t_s = float((frame_idx - 1) / max(fps, 1e-6))
         while len(release_events) < len(world_state.manipulation_events):
             event = dict(world_state.manipulation_events[len(release_events)])
@@ -779,8 +963,20 @@ def collect_examples(video_path: str, horizon: int = 10):
             obj = world_state.objects.get(object_id)
             if hand is None or obj is None:
                 continue
+            support_label = _infer_grounded_support_label(
+                world_state,
+                str(object_id or ""),
+                obj,
+                fallback=it.get("source_support_label") or obj.get("support_target_label", ""),
+            )
+            if support_label:
+                obj["support_target_label"] = support_label
             hand_speed = float(np.linalg.norm(np.asarray(hand.get("velocity_3d", [0.0, 0.0, 0.0]), dtype=np.float32)))
             obj_speed = float(np.linalg.norm(np.asarray(obj.get("velocity_3d", [0.0, 0.0, 0.0]), dtype=np.float32)))
+            semantic_identity_label = normalize_label(obj.get("semantic_label", ""))
+            visual_identity_label = obj.get("visual_identity_label", "")
+            if not visual_identity_label and semantic_identity_label in {"baby bottle", "toy giraffe"}:
+                visual_identity_label = semantic_identity_label
             feat = build_feature_vector(
                 hand.get("jepa_temporal_embedding", hand.get("jepa_embedding", [])),
                 obj.get("jepa_temporal_embedding", obj.get("jepa_embedding", [])),
@@ -792,7 +988,7 @@ def collect_examples(video_path: str, horizon: int = 10):
                 int(hand.get("contact_streak", 0)),
                 obj_pos_3d=obj.get("position_3d", [0.0, 0.0, 0.0]),
                 bbox=obj.get("bbox", []),
-                support_label=it.get("source_support_label") or obj.get("support_target_label", ""),
+                support_label=support_label,
             )
             rows.append({
                 "frame": len(rows),
@@ -800,9 +996,15 @@ def collect_examples(video_path: str, horizon: int = 10):
                 "video_time_s": t_s,
                 "hand_id": it.get("hand_id"),
                 "object_id": object_id,
-                "object_label": obj.get("label"),
+                "object_label": obj.get("scene_memory_label") or obj.get("semantic_label") or obj.get("label"),
                 "object_raw_label": obj.get("raw_label"),
-                "source_support_label": it.get("source_support_label") or obj.get("support_target_label", ""),
+                "scene_memory_id": obj.get("scene_memory_id", ""),
+                "scene_memory_label": obj.get("scene_memory_label", ""),
+                "scene_memory_score": float(obj.get("scene_memory_score", 0.0) or 0.0),
+                "visual_identity_label": visual_identity_label,
+                "visual_identity_score": float(obj.get("visual_identity_score", 0.0) or 0.0),
+                "visual_identity_margin": float(obj.get("visual_identity_margin", 0.0) or 0.0),
+                "source_support_label": support_label,
                 "bbox": obj.get("bbox", []),
                 "feat": feat.tolist(),
                 "is_contacting": bool(it.get("is_contacting", False)),

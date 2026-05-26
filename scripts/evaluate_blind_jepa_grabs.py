@@ -93,6 +93,31 @@ def target_from_bbox(row: dict) -> str:
     return label if score <= 1.85 else ""
 
 
+def canonical_support(label: str) -> str:
+    text = str(label or "").strip().lower().replace("_", " ")
+    if text in {"black mat", "table mat", "placemat", "dish", "plate"}:
+        return "mat"
+    if text in {"plastic tray", "white tray"}:
+        return "tray"
+    return text
+
+
+def grounded_transfer_target(row: dict) -> str:
+    source = canonical_support(row.get("source_support_label") or row.get("support_target_label") or "")
+    if source == "mat":
+        return "tray"
+    if source == "tray":
+        return "mat"
+    return ""
+
+
+def decoded_target_from_row(row: dict, target_prob: float, target_tray_threshold: float) -> str:
+    grounded = grounded_transfer_target(row)
+    if grounded:
+        return grounded
+    return "tray" if float(target_prob) >= float(target_tray_threshold) else "mat"
+
+
 def decode_events(
     rows: list[dict],
     probs: np.ndarray,
@@ -125,7 +150,7 @@ def decode_events(
             target_prob = target_probs[i_peak]
             t = times[i_peak]
         label = visual_label_from_row(row)
-        learned_target = "tray" if float(target_prob) >= float(target_tray_threshold) else "mat"
+        learned_target = decoded_target_from_row(row, float(target_prob), float(target_tray_threshold))
         teacher_target = str(row.get("future_episode_target") or row.get("episode_target") or target_from_bbox(row) or "")
         events.append(
             {

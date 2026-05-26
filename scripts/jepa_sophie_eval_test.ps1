@@ -6,6 +6,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 $env:PERCEPTION_SEGMENTATION_BACKEND = "fastsam-s"
 $env:DEMO_SCENE_PROFILE = "sophie"
+$env:DEMO_TRANSFER_TARGETS = "mat,tray"
 $env:STATIC_TARGET_LABELS = "tray,mat,black mat,table mat,placemat,dish,plate,unknown_seg"
 $env:STATIC_TARGET_INFER_LARGE_LABEL = "tray"
 $env:STATIC_TARGET_INFER_SMALL_LABEL = ""

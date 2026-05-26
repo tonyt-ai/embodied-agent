@@ -3,7 +3,7 @@
 A real-time, 3D grounded world model demo for egocentric assisted-living tasks with an embodied agent.
 
 The current repository showcases hand-object interactions in a real-world environment, observed by an embodied AI agent.
-The system watches the scene from an egocentric video, builds a persistent 3D scene prior, tracks hands and objects online, predicts likely interaction futures and targets, asks an LLM (Gemini) to refine weak object labels, and speaks timely guidance through a live avatar.
+The system watches the scene from an egocentric video, builds a persistent 3D scene prior, tracks hands and objects online, predicts likely interaction futures and targets, asks an LLM (Gemini) to refine weak object labels, also using grounded scene memory (RAG-like), and speaks timely guidance through a live avatar.
 
 ![Sophie demo prediction overlay: hand/object tracking with a predicted tray destination.](public/sophie_demo_prediction.jpg)
 
@@ -11,7 +11,7 @@ Current demo shows JEPA prediction cues: the hand is holding Sophie the giraffe,
 
 ## What The System Contains
 
-The current design focuses on grounded interaction u  nderstanding and consists of several modules:
+The current design focuses on grounded interaction understanding and consists of several modules:
 
 - COLMAP sparse SfM for the offline/static scene prior.
 - Online sparse SLAM/PnP for camera motion and persistent map alignment during interaction.
@@ -22,6 +22,7 @@ The current design focuses on grounded interaction u  nderstanding and consists 
 - MediaPipe Hands for 2D hand landmarks, lifted into 3D with depth and camera geometry.
 - Depth Anything monocular depth via Hugging Face Transformers when available, with a heuristic fallback if the model cannot load.
 - Gemini label refinement for objects that detectors label weakly or generically.
+- Grounded scene memory: persistent entities with 3D anchors, support-region history, and V-JEPA2.1/DINOv2 prototypes so labels can be retrieved from the scene rather than guessed from one noisy frame (RAG-like layer).
 - Geometry-teacher contact and release detection from hand/object distance in 3D.
 - An interaction-conditioned temporal head that predicts next contact, destination likelihood, object motion, and future latent state from recent hand-object-target state.
 - UI attention heatmaps over likely grabbed objects and predicted destinations.
@@ -30,7 +31,7 @@ The current design focuses on grounded interaction u  nderstanding and consists 
 ```text
 static SfM/COLMAP prior -> online SLAM/depth -> persistent objects/targets
               -> hand-object contact -> JEPA future prediction
-              -> Gemini labels/speech -> UI heatmaps/avatar feedback
+              -> Gemini labels/speech with grounded scene memory -> UI heatmaps/avatar feedback
 ```
 
 ## LLM And Avatar Bridge
@@ -38,6 +39,7 @@ static SfM/COLMAP prior -> online SLAM/depth -> persistent objects/targets
 Gemini is used in two places:
 
 - Label refinement: the perception stack sends object/target crops and lightweight context to Gemini when detector labels are weak or generic. Gemini can refine labels such as `baby bottle`, `Sophie the giraffe`, `mat`, or `tray`, but those names do not create physical state by themselves.
+- A RAG is used as grounded scene memory, not text-only retrieval. The assistant can have a persistent memory of this specific environment.
 - Assistant speech: the UI and Node bridge use Gemini/LiveAvatar to speak concise, spatially grounded feedback such as first hand detection, likely grabbed object, and predicted destination.
 
 The LLM is deliberately downstream of the world model. It translates and refines what the grounded system sees. Geometry, SLAM, depth, tracking, and contact logic provide the metric state and teacher signals; the learned temporal world model predicts how that grounded state is likely to evolve.
@@ -49,7 +51,7 @@ This demo deliberately uses both explicit and latent structure:
 - Explicit state: persistent 3D targets, object tracks, hand tracks, camera pose, contact/release events, and source/destination relations.
 - Latent state: V-JEPA2.1 visual embeddings, temporal embedding memory, and the learned temporal head's future latent prediction. DINOv2 embeddings remain available as a fallback/baseline.
 
-Persistence is meaningful here because targets and objects keep stable IDs and 3D anchors across frames, even when detector labels flicker or objects are temporarily weakly observed. That persistence is currently maintained by explicit geometry, tracking, and appearance memory; the learned temporal head predicts over those grounded tokens rather than replacing them.
+Persistence is meaningful here because targets and objects keep stable IDs and 3D anchors across frames, even when detector labels flicker or objects are temporarily weakly observed. A small grounded scene-memory layer retrieves object identity from accumulated V-JEPA2.1/DINOv2 prototypes, 3D position, and support-region history, instead of relying on aliases or the latest detector label. The learned temporal head predicts over those grounded tokens rather than replacing them.
 
 This is a pragmatic world model rather than a pure latent-only model. The explicit 3D state makes the demo inspectable and physically grounded with commodity webcam input. The latent side is used where it helps most now: re-ID, temporal memory, contact/placement prediction, motion prediction, and future visual-state prediction.
 
@@ -150,6 +152,7 @@ Core files:
 - `server/live-bridge.mjs`: Gemini label/speech/avatar bridge.
 - `world_model/server.py`: realtime perception and WebSocket backend.
 - `world_model/world_state.py`: persistent 3D state, targets, hands, contact, prediction candidates.
+- `world_model/scene_memory.py`: grounded scene memory for persistent object/place labels and identity retrieval.
 - `world_model/hands.py`: MediaPipe hand tracking and 3D hand localization.
 - `world_model/perception_candidates.py`: detector/segmenter candidate construction.
 - `world_model/jepa_encoder.py`: V-JEPA2.1 visual features, with DINOv2 fallback for portability.

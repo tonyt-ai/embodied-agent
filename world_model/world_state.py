@@ -14,6 +14,7 @@ import time
 import os
 import numpy as np
 from jepa_interaction_head import interaction_score as jepa_interaction_score
+from scene_memory import SceneMemory
 from semantic_labels import normalize_label
 from temporal_interaction_head import (
     TemporalInteractionPredictor,
@@ -168,6 +169,12 @@ class WorldState:
             ).split(",")
             if item.strip()
         }
+        self.scene_memory = SceneMemory(
+            profile=self.scene_profile,
+            support_labels=self.static_target_labels,
+            deny_labels=self.interaction_label_denylist,
+        )
+        self.object_support_memory = {}
         self.hand_interaction_sides = {
             item.strip().lower()
             for item in os.environ.get("HAND_INTERACTION_SIDES", "right").split(",")
@@ -330,6 +337,16 @@ class WorldState:
         return not det_cls or not obj_cls or det_cls == obj_cls
 
     def _interaction_display_label(self, item, fallback="object"):
+        mem_label = self._normalized_label((item or {}).get("scene_memory_label", ""))
+        try:
+            mem_score = float((item or {}).get("scene_memory_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            mem_score = 0.0
+        if mem_label and mem_score >= 0.45 and mem_label not in self.static_target_labels:
+            return mem_label
+        semantic_label = self._normalized_label((item or {}).get("semantic_label", ""))
+        if semantic_label and semantic_label not in self.static_target_labels:
+            return semantic_label
         visual_class = self._sophie_visual_class(item or {})
         if visual_class == "baby_bottle":
             return "baby bottle"
@@ -631,6 +648,8 @@ class WorldState:
             for obj in self.export_objects()
         ]
         self._update_static_targets()
+        self._update_object_support_memory(now)
+        self._update_scene_memory(now)
         self._update_hand_tracks(now)
         self._update_hand_object_interactions(now)
         self.world_debug["hand_object_interactions"] = self.hand_object_interactions
@@ -638,16 +657,17 @@ class WorldState:
         self.world_debug["hand_trajectories"] = self._export_hand_trajectories()
         self.world_debug["manipulation_events"] = self.manipulation_events[-20:]
         self.world_debug["manipulation_active"] = list(self.manipulation_active.values())[-8:]
-        self._update_object_support_memory(now)
         self.world_debug["hands_tracked"] = len(self.hand_tracks)
         static_targets_export = self._export_static_targets()
         self.world_debug["static_targets"] = static_targets_export
+        self.world_debug["support_regions"] = self._support_region_targets()
         self.world_debug["static_targets_locked"] = int(sum(1 for t in self.static_targets.values() if bool(t.get("locked", False))))
         self.world_debug["static_targets_persistent"] = int(sum(1 for t in static_targets_export if bool(t.get("persistent", False))))
         object_memory_export = self.export_object_memory()
         self.world_debug["object_memory"] = object_memory_export[:12]
         self.world_debug["object_memory_count"] = int(len(object_memory_export))
         self.world_debug["object_memory_hidden_count"] = int(sum(1 for o in object_memory_export if not bool(o.get("visible", False))))
+        self.world_debug["scene_memory"] = self.scene_memory.export()
         self.world_debug["label_refinements"] = {
             "count": int(len(self.label_refinements)),
             "latest": self.label_refinements,
@@ -661,6 +681,12 @@ class WorldState:
             "objects_with_temporal": int(sum(1 for o in self.objects.values() if isinstance(o.get("jepa_temporal_embedding"), list) and len(o.get("jepa_temporal_embedding", [])) > 0)),
             "hands_with_temporal": int(sum(1 for h in self.hand_tracks.values() if isinstance(h.get("jepa_temporal_embedding"), list) and len(h.get("jepa_temporal_embedding", [])) > 0)),
         }
+
+    def _update_scene_memory(self, now):
+        for obj in self.objects.values():
+            if obj.get("missing_since") is not None:
+                continue
+            self.scene_memory.update_object(obj, now)
 
     def _as_vec3(self, value):
         if not isinstance(value, (list, tuple)) or len(value) < 3:
@@ -1238,25 +1264,96 @@ class WorldState:
             return False
         return bool(x1 <= cx <= x2 and y1 <= cy <= y2)
 
-    def _find_best_static_target(self, object_camera_pos, object_bbox=None):
-        if object_camera_pos is None:
+    def _bbox_union(self, boxes):
+        valid = []
+        for box in boxes:
+            if isinstance(box, (list, tuple)) and len(box) >= 4:
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in box[:4]]
+                except (TypeError, ValueError):
+                    continue
+                if x2 > x1 and y2 > y1:
+                    valid.append((x1, y1, x2, y2))
+        if not valid:
             return None
-        candidates = [t for t in self.static_targets.values() if bool(t.get("locked", False))]
+        return [
+            round(max(0.0, min(b[0] for b in valid)), 4),
+            round(max(0.0, min(b[1] for b in valid)), 4),
+            round(min(1.0, max(b[2] for b in valid)), 4),
+            round(min(1.0, max(b[3] for b in valid)), 4),
+        ]
+
+    def _support_region_targets(self):
+        """Aggregate static fragments into one persistent region per support label."""
+        transfer_targets = set(self._configured_transfer_targets())
+        if not transfer_targets:
+            return []
+        grouped = {}
+        for t in self.static_targets.values():
+            if not bool(t.get("locked", False)):
+                continue
+            label = self._canonical_support_label(t.get("label", ""))
+            if label not in transfer_targets:
+                continue
+            projection = self._project_static_target(t)
+            cam = self._as_vec3(projection.get("position_camera_3d_current")) or self._as_vec3(t.get("position_camera_3d"))
+            bbox = projection.get("projected_bbox") or t.get("bbox")
+            bucket = grouped.setdefault(label, {"items": [], "boxes": [], "cams": [], "hits": 0})
+            bucket["items"].append(t)
+            bucket["hits"] += int(t.get("hits", 0) or 0)
+            if bbox:
+                bucket["boxes"].append(bbox)
+            if cam is not None:
+                bucket["cams"].append(cam)
+        regions = []
+        for label, bucket in grouped.items():
+            if not bucket["items"]:
+                continue
+            bbox = self._bbox_union(bucket["boxes"])
+            cams = bucket["cams"]
+            if cams:
+                cam = [sum(float(c[i]) for c in cams) / float(len(cams)) for i in range(3)]
+            else:
+                cam = None
+            regions.append({
+                "id": f"support_{label}",
+                "label": label,
+                "hits": bucket["hits"],
+                "locked": True,
+                "persistent": True,
+                "bbox": bbox,
+                "position_camera_3d": cam,
+                "support_region": True,
+                "fragments": len(bucket["items"]),
+            })
+        return regions
+
+    def _find_best_static_target(self, object_camera_pos, object_bbox=None):
+        if object_camera_pos is None and object_bbox is None:
+            return None
+        transfer_targets = set(self._configured_transfer_targets())
+        support_regions = self._support_region_targets()
+        candidates = support_regions if support_regions else [t for t in self.static_targets.values() if bool(t.get("locked", False))]
         if not candidates:
             return None
         best = None
         for t in candidates:
             projection = self._project_static_target(t)
             tcam = self._as_vec3(projection.get("position_camera_3d_current")) or self._as_vec3(t.get("position_camera_3d"))
-            if tcam is None:
-                continue
-            d3 = self._distance3(object_camera_pos, tcam)
-            dx = abs(float(object_camera_pos[0]) - float(tcam[0]))
-            dy = abs(float(object_camera_pos[1]) - float(tcam[1]))
-            xy = math.sqrt(dx * dx + dy * dy)
             target_bbox = projection.get("projected_bbox") or t.get("bbox")
+            if tcam is None and target_bbox is None:
+                continue
+            if object_camera_pos is not None and tcam is not None:
+                d3 = self._distance3(object_camera_pos, tcam)
+                dx = abs(float(object_camera_pos[0]) - float(tcam[0]))
+                dy = abs(float(object_camera_pos[1]) - float(tcam[1]))
+                xy = math.sqrt(dx * dx + dy * dy)
+            else:
+                d3 = 9.0
+                xy = 9.0
             overlap = self._bbox_intersection_over_min_area(object_bbox, target_bbox)
             center_inside = self._bbox_center_inside(object_bbox, target_bbox)
+            target_label = self._canonical_support_label(t.get("label", "target"))
             score = (
                 3.0 * (1.0 if center_inside else 0.0)
                 + 2.2 * min(1.0, float(overlap))
@@ -1264,10 +1361,12 @@ class WorldState:
                 + 0.6 * (1.0 - min(1.0, d3 / 1.25))
                 + 0.03 * min(10.0, float(t.get("hits", 0) or 0))
             )
+            if transfer_targets:
+                score += 1.8 if target_label in transfer_targets else -1.6
             if best is None or score > best["support_score"]:
                 best = {
                     "object_id": t.get("id"),
-                    "label": t.get("label", "target"),
+                    "label": target_label or t.get("label", "target"),
                     "distance_m": float(d3),
                     "xy_distance_m": float(xy),
                     "other_cam": tcam,
@@ -1379,6 +1478,46 @@ class WorldState:
         out["support_inferred_from_transfer_memory"] = True
         return out
 
+    def _object_memory_keys(self, obj):
+        if not isinstance(obj, dict):
+            return []
+        keys = []
+        for key in ("scene_memory_id", "scene_memory_label", "visual_identity_label", "semantic_label", "label"):
+            value = obj.get(key)
+            if value:
+                text = self._interaction_display_label(obj, str(value)) if key in {"semantic_label", "label"} else str(value)
+                text = self._normalized_label(text)
+                if text and text not in self.static_target_labels and text not in self.interaction_label_denylist:
+                    keys.append(f"{key}:{text}")
+        out = []
+        seen = set()
+        for key in keys:
+            if key not in seen:
+                out.append(key)
+                seen.add(key)
+        return out
+
+    def _remember_object_support(self, obj, label, relation=None, now=None):
+        support_label = self._canonical_support_label(label)
+        if support_label not in self._configured_transfer_targets():
+            return
+        payload = {
+            "support_target_label": support_label,
+            "support_relation": relation or {},
+            "updated_time": float(now if now is not None else time.time()),
+        }
+        for key in self._object_memory_keys(obj):
+            self.object_support_memory[key] = payload
+
+    def _recall_object_support(self, obj):
+        for key in self._object_memory_keys(obj):
+            payload = self.object_support_memory.get(key)
+            if isinstance(payload, dict):
+                label = self._canonical_support_label(payload.get("support_target_label"))
+                if label in self._configured_transfer_targets():
+                    return label
+        return None
+
     def _support_relation_confident(self, relation):
         if relation is None:
             return False
@@ -1412,12 +1551,13 @@ class WorldState:
             obj["support_target_id"] = relation.get("nearest_object_id")
             obj["support_target_label"] = support_label
             obj["support_updated_time"] = now
+            self._remember_object_support(obj, support_label, relation=relation, now=now)
 
     def _find_place_relation(self, object_id, object_camera_pos, object_bbox=None):
-        if object_camera_pos is None:
+        if object_camera_pos is None and object_bbox is None:
             return None
         nearest = self._find_best_static_target(object_camera_pos, object_bbox=object_bbox)
-        if nearest is None:
+        if nearest is None and object_camera_pos is not None and not self._configured_transfer_targets():
             for other in self.export_objects():
                 other_id = other.get("id")
                 if other_id == object_id:
@@ -1436,11 +1576,23 @@ class WorldState:
         if nearest is None:
             return None
 
-        dx = abs(float(object_camera_pos[0]) - float(nearest["other_cam"][0]))
-        dy = abs(float(object_camera_pos[1]) - float(nearest["other_cam"][1]))
-        dz = float(object_camera_pos[2]) - float(nearest["other_cam"][2])
-        is_near_xy = dx <= self.manip_relation_near_xy_m and dy <= self.manip_relation_near_xy_m
-        is_near_3d = float(nearest["distance_m"]) <= self.manip_relation_near_3d_m
+        other_cam = nearest.get("other_cam")
+        if object_camera_pos is not None and other_cam is not None:
+            dx = abs(float(object_camera_pos[0]) - float(other_cam[0]))
+            dy = abs(float(object_camera_pos[1]) - float(other_cam[1]))
+            dz = float(object_camera_pos[2]) - float(other_cam[2])
+            delta_camera_xyz = [
+                round(float(object_camera_pos[0] - other_cam[0]), 4),
+                round(float(object_camera_pos[1] - other_cam[1]), 4),
+                round(dz, 4),
+            ]
+            is_near_xy = dx <= self.manip_relation_near_xy_m and dy <= self.manip_relation_near_xy_m
+            is_near_3d = float(nearest["distance_m"]) <= self.manip_relation_near_3d_m
+        else:
+            dz = 0.0
+            delta_camera_xyz = [0.0, 0.0, 0.0]
+            is_near_xy = False
+            is_near_3d = False
         support_score = float(nearest.get("support_score", 0.0) or 0.0)
         bbox_overlap = float(nearest.get("bbox_overlap", 0.0) or 0.0)
         center_inside = bool(nearest.get("bbox_center_inside", False))
@@ -1453,9 +1605,7 @@ class WorldState:
             "support_score": round(float(support_score), 4),
             "bbox_overlap": round(float(bbox_overlap), 4),
             "bbox_center_inside": bool(center_inside),
-            "delta_camera_xyz": [round(float(object_camera_pos[0] - nearest["other_cam"][0]), 4),
-                                 round(float(object_camera_pos[1] - nearest["other_cam"][1]), 4),
-                                 round(dz, 4)],
+            "delta_camera_xyz": delta_camera_xyz,
             "is_near_3d": bool(is_near_3d or is_on_support),
             "is_behind_nearest": bool(is_behind),
             "is_on_support": bool(is_on_support),
@@ -1537,9 +1687,11 @@ class WorldState:
                 )
                 persistent_target = str(self._persistent_transfer_target_for_object(str(obj.get("id") or ""), decoded_target_label) or "")
                 target_is_uncertain = abs(temporal_target_prob - temporal_target_threshold) <= 0.16
-                if (
+                if self._canonical_support_label(persistent_target) in self._configured_transfer_targets() and (
                     target_is_uncertain
-                    and self._canonical_support_label(persistent_target) in self._configured_transfer_targets()
+                    or decoded_target is None
+                    or decoded_target_score < 0.70
+                    or self._canonical_support_label(decoded_target_label) not in self._configured_transfer_targets()
                 ):
                     decoded_target_label = persistent_target
                 pred_future_latent = temporal_pred.get("future_latent", [])
@@ -1724,8 +1876,12 @@ class WorldState:
                     object_bbox=active_object.get("bbox") if active_object else None,
                 )
                 memory_source_label = self._canonical_support_label(active_object.get("support_target_label")) if active_object else None
+                if memory_source_label not in self._configured_transfer_targets():
+                    memory_source_label = self._recall_object_support(active_object)
                 if memory_source_label in self._configured_transfer_targets():
                     source_relation = self._relation_with_label(source_relation or {}, memory_source_label)
+                elif not self._support_relation_confident(source_relation):
+                    source_relation = None
                 self.manipulation_active[hand_id] = {
                     "hand_id": hand_id,
                     "object_id": nearest["object_id"],
@@ -1747,14 +1903,25 @@ class WorldState:
                 })
 
             learned_state = self.learned_manipulation_active.get(hand_id)
+            learned_same_label_candidate = None
             if learned_state is not None:
                 active_learned_id = str(learned_state.get("object_id") or "")
+                active_learned_label = self._normalized_label(learned_state.get("label", ""))
                 same_object_candidate = next(
                     (c for c in movable_temporal_candidates if str(c.get("object_id") or "") == active_learned_id),
                     None,
                 )
                 if same_object_candidate is not None:
                     learned_candidate = same_object_candidate
+                elif active_learned_label:
+                    learned_same_label_candidate = next(
+                        (
+                            c for c in movable_temporal_candidates
+                            if self._normalized_label(c.get("label", "")) == active_learned_label
+                            and float(c.get("pred_contact_prob", 0.0) or 0.0) >= max(0.30, self.learned_contact_threshold * 0.55)
+                        ),
+                        None,
+                    )
             grounded_temporal_candidate = next(
                 (c for c in intent_candidates if str(c.get("object_id") or "") == str(nearest.get("object_id") or "")),
                 None,
@@ -1763,7 +1930,11 @@ class WorldState:
             # original object. The hand can pass near the other object or a static
             # target during the transfer; those nearby rows should not steal the
             # episode label, target, or release state.
-            learned_source_candidate = learned_candidate if learned_state is not None else grounded_temporal_candidate
+            learned_source_candidate = (
+                (same_object_candidate or learned_same_label_candidate)
+                if learned_state is not None
+                else grounded_temporal_candidate
+            )
             learned_source = learned_source_candidate or grounded_temporal_candidate or {
                 "object_id": nearest.get("object_id"),
                 "label": self._interaction_display_label(self._find_object_by_id(nearest.get("object_id"), include_missing=True) or nearest, nearest.get("label", "object")),
@@ -1775,6 +1946,15 @@ class WorldState:
                 ),
                 "pred_target_motion_score": float((nearest.get("decoded_target") or {}).get("score", 0.0) or 0.0),
             }
+            if learned_state is not None and learned_source_candidate is None:
+                learned_source = {
+                    "object_id": learned_state.get("object_id", ""),
+                    "label": learned_state.get("label", "object"),
+                    "pred_contact_prob": float(learned_state.get("contact_prob", 0.0) or 0.0),
+                    "pred_release_prob": float(learned_state.get("release_prob", 0.0) or 0.0),
+                    "pred_target_label": str(learned_state.get("target_label") or "target"),
+                    "pred_target_motion_score": 0.0,
+                }
             learned_now_held = False
             learned_now_releasing = False
             learned_contact_prob = float(learned_source.get("pred_contact_prob", 0.0) or 0.0)
@@ -1815,14 +1995,28 @@ class WorldState:
             if learned_state is not None:
                 elapsed = max(0.0, now - float(learned_state.get("start_time", now)))
                 active_id = str(learned_state.get("object_id") or "")
-                same_object = bool(not active_id or not learned_obj_id or active_id == learned_obj_id)
-                if same_object and learned_target:
+                same_object = bool(active_id and learned_obj_id and active_id == learned_obj_id)
+                same_label = bool(
+                    self._normalized_label(learned_state.get("label", ""))
+                    and self._normalized_label(learned_state.get("label", "")) == self._normalized_label(learned_label)
+                )
+                can_refresh_learned = bool(learned_source_candidate is not None and (same_object or same_label))
+                if can_refresh_learned and same_object:
+                    learned_state["display_object_id"] = learned_obj_id
+                elif can_refresh_learned and learned_obj_id:
+                    learned_state["display_object_id"] = learned_obj_id
+                if can_refresh_learned and self._canonical_support_label(learned_target) in self._configured_transfer_targets():
                     learned_state["target_label"] = learned_target
                 learned_state["last_update"] = now
-                learned_state["contact_prob"] = max(float(learned_state.get("contact_prob", 0.0) or 0.0), learned_contact_prob)
-                learned_state["release_prob"] = max(float(learned_state.get("release_prob", 0.0) or 0.0), learned_release_prob)
+                if can_refresh_learned:
+                    learned_state["contact_prob"] = max(float(learned_state.get("contact_prob", 0.0) or 0.0) * 0.92, learned_contact_prob)
+                    learned_state["release_prob"] = max(float(learned_state.get("release_prob", 0.0) or 0.0) * 0.92, learned_release_prob)
+                else:
+                    learned_state["contact_prob"] = float(learned_state.get("contact_prob", 0.0) or 0.0) * 0.94
+                    learned_state["release_prob"] = float(learned_state.get("release_prob", 0.0) or 0.0) * 0.94
                 if (
                     elapsed >= self.learned_min_hold_s
+                    and can_refresh_learned
                     and learned_release_prob >= self.learned_release_ui_threshold
                     and learned_state.get("release_time") is None
                 ):
@@ -1908,6 +2102,12 @@ class WorldState:
                         memory_obj["support_target_id"] = place_relation.get("nearest_object_id")
                         memory_obj["support_target_label"] = place_relation.get("nearest_object_label")
                         memory_obj["support_updated_time"] = now
+                        self._remember_object_support(
+                            memory_obj,
+                            place_relation.get("nearest_object_label"),
+                            relation=place_relation,
+                            now=now,
+                        )
                 if hand_id in self.manipulation_active:
                     del self.manipulation_active[hand_id]
                 self.hand_contact_events.append({
@@ -1967,8 +2167,9 @@ class WorldState:
                 reverse=True,
             )[:4]
             held_object_id = str(
-                (hand.get("active_object_id") if is_contacting else "")
-                or (learned_state or {}).get("object_id")
+                ((learned_state or {}).get("display_object_id") if learned_now_held else "")
+                or ((learned_state or {}).get("object_id") if learned_now_held else "")
+                or (hand.get("active_object_id") if is_contacting else "")
                 or ""
             )
             held_object = self._find_object_by_id(held_object_id, include_missing=True) if held_object_id else None
@@ -2013,7 +2214,8 @@ class WorldState:
                 ),
                 "pred_target_tray_prob": round(float(nearest.get("temporal_pred", {}).get("target_tray_prob", 0.5)), 4),
                 "pred_target_label": str(
-                    (nearest.get("decoded_target") or {}).get("target_label")
+                    ((learned_state or {}).get("target_label") if learned_now_held else "")
+                    or (nearest.get("decoded_target") or {}).get("target_label")
                     or nearest.get("temporal_pred", {}).get("target_label", "target")
                 ),
                 "pred_target_id": str((nearest.get("decoded_target") or {}).get("target_id") or ""),

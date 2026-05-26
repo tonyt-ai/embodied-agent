@@ -156,12 +156,14 @@ const MOVABLE_DISPLAY_LABELS = new Set(SCENE_PROFILE.movableLabels);
 const RAW_MOVABLE_DISPLAY_LABELS = new Set(SCENE_PROFILE.rawMovableLabels);
 const TARGET_DISPLAY_LABELS = new Set(SCENE_PROFILE.targetLabels);
 const GUIDANCE_FRESH_MAX_MS = 1800;
-const WORLD_STATE_ACTIONABLE_MAX_MS = 6000;
+const WORLD_STATE_ACTIONABLE_MAX_MS = 2200;
 const WORLD_STATE_RENDERABLE_MAX_MS = 4500;
-const GRABBED_SPEECH_CONTACT_MAX_S = 12.0;
+const GRABBED_SPEECH_CONTACT_MAX_S = 4.0;
 const RELEASED_SPEECH_EVENT_MAX_S = 2.0;
-const INTENT_HUD_LATCH_MS = 6500;
+const INTENT_HUD_LATCH_MS = 1800;
+const TARGET_ATTENTION_LATCH_MS = 3200;
 const RELEASE_UI_ENABLED = true;
+const GEOMETRIC_FALLBACK_CUE_ENABLED = false;
 
 function isMovableDisplayLabel(label: string) {
   const normalized = normalizeDisplayLabel(label);
@@ -366,6 +368,7 @@ export default function Home() {
   const lastGuidanceSignatureRef = useRef<string>("");
   const lastSceneTimelineSpeechRef = useRef<string>("");
   const lastDirectWorldCueRef = useRef<{ signature: string; timeMs: number }>({ signature: "", timeMs: 0 });
+  const browserSpeechSeqRef = useRef<number>(0);
 
   const [worldStateText, setWorldStateText] = useState("");
   const [eventLog, setEventLog] = useState("");
@@ -438,13 +441,14 @@ export default function Home() {
   const [latchedIntentCue, setLatchedIntentCue] = useState<any | null>(null);
   const [latchedAttentionBlobs, setLatchedAttentionBlobs] = useState<any[]>([]);
   const [latchedAttentionAtMs, setLatchedAttentionAtMs] = useState<number>(0);
+  const [latchedTargetByObject, setLatchedTargetByObject] = useState<Record<string, any>>({});
 
   const isEmbodiedMode = captureMode === "embodied";
   const isSocialMode = captureMode === "social";
   const displayedFrameAgeMs = processedFrameTimestamp !== null
     ? Math.max(0, uiNowMs - processedFrameTimestamp)
     : frameAgeMs;
-  const useProcessedPlanningFrame = false;
+  const useProcessedPlanningFrame = isEmbodiedMode && embodiedVideoSource === "scene" && Boolean(processedFrameUrl);
   const worldStateFreshEnough = worldStateReceivedAtMs > 0
     && uiNowMs - worldStateReceivedAtMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
   const planningFreshnessAgeMs = worldStateFreshEnough ? 0 : displayedFrameAgeMs;
@@ -524,9 +528,17 @@ export default function Home() {
     ));
     return raw;
   };
+  const trustedContactLike = (item: any) => {
+    const rawContactAllowed = sceneVideoFile !== "scene_sophie.mp4";
+    return Boolean(
+      item?.learned_is_held
+      || item?.is_touching_strict
+      || (rawContactAllowed && item?.is_contacting)
+    );
+  };
   const contactingObjectIds = new Set(
     handInteractionsData
-      .filter((item: any) => Boolean(item?.is_contacting))
+      .filter((item: any) => trustedContactLike(item))
       .map((item: any) => String(item?.nearest_object_id || "")),
   );
   const manipulatedObjectIds = new Set(
@@ -898,6 +910,54 @@ export default function Home() {
     }
     return bbox;
   };
+  const objectAttentionBoxOk = (bbox: any, labelHint = "", objectHint: any = null) => {
+    if (!Array.isArray(bbox) || bbox.length < 4) return false;
+    const x1 = Number(bbox[0]);
+    const y1 = Number(bbox[1]);
+    const x2 = Number(bbox[2]);
+    const y2 = Number(bbox[3]);
+    if (![x1, y1, x2, y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) return false;
+    const w = x2 - x1;
+    const h = y2 - y1;
+    const area = w * h;
+    const aspect = w / Math.max(0.001, h);
+    const label = normalizeDisplayLabel(labelHint);
+    if (!Number.isFinite(area) || area < 0.003 || area > 0.17) return false;
+    if (label === "baby bottle") return aspect >= 0.18 && aspect <= 1.18 && h <= 0.64;
+    if (label === "toy giraffe") {
+      const visualClass = normalizeDisplayLabel(String(objectHint?.visual_identity_class || objectHint?.visual_identity_label || ""));
+      const hasToyIdentity = !visualClass || ["toy giraffe", "toy_giraffe"].includes(visualClass);
+      return hasToyIdentity && area >= 0.022 && area <= 0.13 && w >= 0.10 && aspect >= 0.38 && aspect <= 1.60 && h <= 0.72;
+    }
+    return aspect >= 0.18 && aspect <= 1.70;
+  };
+  const stableTargetBboxForLabel = (labelHint: string) => {
+    const label = normalizeDisplayLabel(labelHint);
+    if (!isTargetDisplayLabel(label)) return null;
+    const sceneSupportBbox = sceneVideoFile === "scene_sophie.mp4" ? SOPHIE_SCENE_REGION_BOXES[label] : null;
+    const exactTargets = staticTargetObjects
+      .map((obj: any) => {
+        const targetLabel = targetAliasForPreference(displayLabelForObject(obj), label);
+        if (targetLabel !== label) return null;
+        const bbox = targetBboxForObject(obj, label);
+        if (!Array.isArray(bbox) || bbox.length < 4) return null;
+        const area = Math.max(0, Number(bbox[2]) - Number(bbox[0])) * Math.max(0, Number(bbox[3]) - Number(bbox[1]));
+        const maxArea = label === "mat" ? 0.58 : 0.44;
+        if (!Number.isFinite(area) || area <= 0.004 || area > maxArea) return null;
+        return { bbox, hits: Number(obj?.hits ?? 0), persistent: Boolean(obj?.persistent || obj?.locked) };
+      })
+      .filter(Boolean) as Array<{ bbox: number[]; hits: number; persistent: boolean }>;
+    exactTargets.sort((a, b) => Number(b.persistent) - Number(a.persistent) || b.hits - a.hits);
+    if (exactTargets[0]?.bbox) {
+      const bbox = exactTargets[0].bbox;
+      const area = Math.max(0, Number(bbox[2]) - Number(bbox[0])) * Math.max(0, Number(bbox[3]) - Number(bbox[1]));
+      const minSupportArea = label === "mat" ? 0.18 : 0.16;
+      if (sceneSupportBbox && (!Number.isFinite(area) || area < minSupportArea)) return sceneSupportBbox;
+      return bbox;
+    }
+    if (sceneSupportBbox) return sceneSupportBbox;
+    return null;
+  };
   const displayLabelForCandidate = (candidate: any, fallback = "object") => {
     const id = String(candidate?.object_id || candidate?.id || "");
     const obj = id ? objectById.get(id) : null;
@@ -975,6 +1035,30 @@ export default function Home() {
     if (idx < 0) return "";
     return targets[(idx + 1) % targets.length];
   };
+  const supportRegionForObjectBbox = (obj: any) => {
+    if (sceneVideoFile !== "scene_sophie.mp4") return "";
+    const bbox = Array.isArray(obj?.bbox) && obj.bbox.length >= 4 ? obj.bbox : null;
+    if (!bbox) return "";
+    const cx = (Number(bbox[0]) + Number(bbox[2])) * 0.5;
+    const cy = (Number(bbox[1]) + Number(bbox[3])) * 0.5;
+    if (![cx, cy].every(Number.isFinite)) return "";
+    let bestLabel = "";
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const [label, region] of Object.entries(SOPHIE_SCENE_REGION_BOXES)) {
+      const [x1, y1, x2, y2] = region;
+      const rx = (x1 + x2) * 0.5;
+      const ry = (y1 + y2) * 0.5;
+      const rw = Math.max(0.01, x2 - x1);
+      const rh = Math.max(0.01, y2 - y1);
+      const inside = cx >= x1 - 0.03 && cx <= x2 + 0.03 && cy >= y1 - 0.03 && cy <= y2 + 0.03;
+      const score = ((cx - rx) / rw) ** 2 + ((cy - ry) / rh) ** 2 + (inside ? 0 : 0.9);
+      if (score < bestScore) {
+        bestScore = score;
+        bestLabel = label;
+      }
+    }
+    return bestScore <= 1.7 ? bestLabel : "";
+  };
   const hasStaticTargetLabel = (desiredLabel: string) => {
     const desired = normalizeDisplayLabel(desiredLabel);
     return staticTargetObjects.some((target: any) => (
@@ -985,6 +1069,9 @@ export default function Home() {
   const desiredPlaceTargetForObject = (label: string, obj: any) => {
     const normalized = normalizeDisplayLabel(label);
     if (["bottle", "baby bottle", "toy giraffe", "mouse", "donut", "toy"].includes(normalized)) {
+      const supportRegion = supportRegionForObjectBbox(obj);
+      const supportTransferTarget = alternateTransferTarget(supportRegion);
+      if (supportTransferTarget) return supportTransferTarget;
       const source = nearestStaticTargetLabelForObject(obj);
       const transferTarget = alternateTransferTarget(source);
       if (transferTarget) return transferTarget;
@@ -1011,6 +1098,60 @@ export default function Home() {
     }
     return "";
   };
+
+  const fallbackHandObjectCue = (() => {
+    let best: any | null = null;
+    for (const hand of handsData) {
+      const handCenter = Array.isArray(hand?.pixel_center)
+        ? hand.pixel_center
+        : (Array.isArray(hand?.image_norm_center)
+          ? [Number(hand.image_norm_center[0]) * processedFrameSize.width, Number(hand.image_norm_center[1]) * processedFrameSize.height]
+          : null);
+      if (!handCenter) continue;
+      const hx = Number(handCenter[0]) / Math.max(1, processedFrameSize.width);
+      const hy = Number(handCenter[1]) / Math.max(1, processedFrameSize.height);
+      if (![hx, hy].every(Number.isFinite)) continue;
+      for (const obj of observedObjects) {
+        const bbox = Array.isArray(obj?.bbox) && obj.bbox.length >= 4 ? obj.bbox : null;
+        if (!bbox) continue;
+        const label = displayLabelForObject(obj);
+        if (!isMovableDisplayLabel(label)) continue;
+        const x1 = Number(bbox[0]);
+        const y1 = Number(bbox[1]);
+        const x2 = Number(bbox[2]);
+        const y2 = Number(bbox[3]);
+        if (![x1, y1, x2, y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) continue;
+        const area = (x2 - x1) * (y2 - y1);
+        if (!Number.isFinite(area) || area <= 0.0015 || area > 0.20) continue;
+        const cx = (x1 + x2) * 0.5;
+        const cy = (y1 + y2) * 0.5;
+        const dx = hx - cx;
+        const dy = hy - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const handInside = hx >= x1 - 0.04 && hx <= x2 + 0.04 && hy >= y1 - 0.05 && hy <= y2 + 0.05;
+        if (!handInside && dist > 0.34) continue;
+        const score = Math.max(
+          handInside ? 0.72 : 0.0,
+          Math.max(0.38, Math.min(0.82, 0.86 - dist * 1.45))
+        );
+        const targetLabel = desiredPlaceTargetForObject(label, obj);
+        const cue = {
+          hand,
+          obj,
+          objectId: String(obj?.id || ""),
+          objectLabel: label,
+          targetLabel,
+          bbox: [x1, y1, x2, y2],
+          handX: hx,
+          handY: hy,
+          score,
+          distanceNorm: dist,
+        };
+        if (!best || cue.score > Number(best.score ?? 0)) best = cue;
+      }
+    }
+    return best;
+  })();
 
   const attentionBlobs: Array<{ id: string; kind: "grab" | "place"; x1: number; y1: number; x2: number; y2: number; score: number; label: string }> = [];
   const attentionLinks: Array<{ id: string; fromX: number; fromY: number; toX: number; toY: number; kind: "grab" | "place"; score: number }> = [];
@@ -1040,13 +1181,14 @@ export default function Home() {
     const plannedLabel = topPredictedGrab ? displayLabelForCandidate(topPredictedGrab) : nearestLabel;
     const distanceM = Number(interaction?.distance_m ?? 9);
     const predContact = Number(interaction?.pred_contact_prob ?? 0);
-    const isContactLike = Boolean(interaction?.learned_is_held || interaction?.is_contacting || interaction?.is_touching_strict);
+    const isContactLike = trustedContactLike(interaction);
     const isHoldingMovable = isContactLike && isMovableDisplayLabel(heldLabel);
+    const interactionIsReleasing = Boolean(interaction?.learned_releasing) || Number(interaction?.pred_release_prob ?? 0) >= 0.55;
     const topPredictedGrabScore = Number(topPredictedGrab?.pred_contact_prob ?? 0);
     const isPlanningMovable = isMovableDisplayLabel(plannedLabel)
       && Boolean(isContactLike || interaction?.is_near || distanceM < 0.45 || predContact > 0.16 || topPredictedGrabScore >= 0.35);
 
-    if (isHoldingMovable && heldObject?.bbox && Array.isArray(heldObject.bbox) && heldObject.bbox.length >= 4) {
+    if (isHoldingMovable && !interactionIsReleasing && heldObject?.bbox && objectAttentionBoxOk(heldObject.bbox, heldLabel, heldObject)) {
       const bbox = heldObject.bbox;
       attentionBlobs.push({
         id: `grab-${interaction?.hand_id}-${heldObjectId || "held"}`,
@@ -1059,7 +1201,7 @@ export default function Home() {
         label: heldLabel,
       });
     }
-    if (!isHoldingMovable && isPlanningMovable && nearestObject?.bbox && Array.isArray(nearestObject.bbox) && nearestObject.bbox.length >= 4) {
+    if (!isHoldingMovable && isPlanningMovable && nearestObject?.bbox && objectAttentionBoxOk(nearestObject.bbox, nearestLabel, nearestObject)) {
       const bbox = nearestObject.bbox;
       const nearScore = Math.max(0.42, Math.min(0.76, 0.78 - distanceM * 0.85));
       attentionBlobs.push({
@@ -1077,11 +1219,9 @@ export default function Home() {
       const id = String(c?.object_id || "");
       const obj = objectById.get(id);
       const bbox = obj?.bbox;
-      if (!Array.isArray(bbox) || bbox.length < 4) continue;
       const label = displayLabelForCandidate(c);
       if (!isMovableDisplayLabel(label)) continue;
-      const area = Math.max(0, Number(bbox[2]) - Number(bbox[0])) * Math.max(0, Number(bbox[3]) - Number(bbox[1]));
-      if (!Number.isFinite(area) || area > 0.18) continue;
+      if (!objectAttentionBoxOk(bbox, label, obj)) continue;
       const rawScore = Number(c?.pred_contact_prob ?? 0);
       const latentConf = Number(c?.pred_future_latent_confidence ?? 0);
       const score = Number.isFinite(latentConf) && latentConf > 0
@@ -1101,7 +1241,26 @@ export default function Home() {
       || learnedPlaceTargetForCue(interaction, topPredictedGrab)
       || desiredPlaceTargetForObject(isHoldingMovable ? heldLabel : plannedLabel, isHoldingMovable ? heldObject : plannedObject);
     let addedPlaceBlob = false;
-    for (const c of (isHoldingMovable && isTargetDisplayLabel(desiredPlaceLabel) ? [] : rankedPlace.slice(0, 2))) {
+    const stableDesiredTargetBbox = isHoldingMovable ? stableTargetBboxForLabel(desiredPlaceLabel) : null;
+    if (Array.isArray(stableDesiredTargetBbox) && stableDesiredTargetBbox.length >= 4) {
+      attentionBlobs.push({
+        id: `place-stable-${interaction?.hand_id}-${desiredPlaceLabel}`,
+        kind: "place",
+        x1: Number(stableDesiredTargetBbox[0]),
+        y1: Number(stableDesiredTargetBbox[1]),
+        x2: Number(stableDesiredTargetBbox[2]),
+        y2: Number(stableDesiredTargetBbox[3]),
+        score: isHoldingMovable ? 0.94 : 0.78,
+        label: desiredPlaceLabel,
+      });
+      if (Number.isFinite(hcx) && Number.isFinite(hcy)) {
+        const cx = ((Number(stableDesiredTargetBbox[0]) + Number(stableDesiredTargetBbox[2])) * 0.5) * processedFrameSize.width;
+        const cy = ((Number(stableDesiredTargetBbox[1]) + Number(stableDesiredTargetBbox[3])) * 0.5) * processedFrameSize.height;
+        attentionLinks.push({ id: `place-link-stable-${interaction?.hand_id}-${desiredPlaceLabel}`, fromX: hcx, fromY: hcy, toX: cx, toY: cy, kind: "place", score: isHoldingMovable ? 0.94 : 0.78 });
+      }
+      addedPlaceBlob = true;
+    }
+    for (const c of (addedPlaceBlob || isHoldingMovable ? [] : rankedPlace.slice(0, 1))) {
       const id = String(c?.object_id || "");
       const obj = objectById.get(id);
       const rawCandidateLabel = normalizeDisplayLabel(String(c?.label || ""));
@@ -1131,7 +1290,7 @@ export default function Home() {
       }
       addedPlaceBlob = true;
     }
-    if (!addedPlaceBlob && isTargetDisplayLabel(desiredPlaceLabel)) {
+    if (!addedPlaceBlob && isHoldingMovable && isTargetDisplayLabel(desiredPlaceLabel)) {
       const fallbackTarget = targetFallbackObject(desiredPlaceLabel);
       const bbox = targetBboxForObject(fallbackTarget, desiredPlaceLabel);
       if (Array.isArray(bbox) && bbox.length >= 4) {
@@ -1153,6 +1312,23 @@ export default function Home() {
       }
     }
   }
+  if (GEOMETRIC_FALLBACK_CUE_ENABLED && fallbackHandObjectCue && !attentionBlobs.some((item) => item.kind === "grab")) {
+    const bbox = fallbackHandObjectCue.bbox;
+    const fallbackObjectLabel = String(fallbackHandObjectCue.objectLabel || "object");
+    const fallbackBoxOk = objectAttentionBoxOk(bbox, fallbackObjectLabel, fallbackHandObjectCue.obj);
+    if (fallbackBoxOk) {
+      attentionBlobs.push({
+        id: `grab-fallback-${fallbackHandObjectCue.objectId || fallbackHandObjectCue.objectLabel}`,
+        kind: "grab",
+        x1: Number(bbox[0]),
+        y1: Number(bbox[1]),
+        x2: Number(bbox[2]),
+        y2: Number(bbox[3]),
+        score: Number(fallbackHandObjectCue.score || 0.58),
+        label: fallbackObjectLabel,
+      });
+    }
+  }
   const seenAttentionKeys = new Set<string>();
   const attentionKindCounts: Record<"grab" | "place", number> = { grab: 0, place: 0 };
   const planningAttentionBlobs = [...attentionBlobs]
@@ -1160,7 +1336,7 @@ export default function Home() {
     .filter((item) => {
       const key = `${item.kind}:${item.id}`;
       if (seenAttentionKeys.has(key)) return false;
-      const limit = item.kind === "grab" ? 1 : 2;
+      const limit = 1;
       if (attentionKindCounts[item.kind] >= limit) return false;
       seenAttentionKeys.add(key);
       attentionKindCounts[item.kind] += 1;
@@ -1168,6 +1344,38 @@ export default function Home() {
     });
   const planningFreshEnough = worldStateFreshEnough
     || (displayedFrameAgeMs != null && displayedFrameAgeMs <= WORLD_STATE_ACTIONABLE_MAX_MS);
+  const firstLiveTargetBlob = planningAttentionBlobs.find((item) => item.kind === "place" && isTargetDisplayLabel(item.label)) || null;
+  const firstLiveGrabBlob = planningAttentionBlobs.find((item) => item.kind === "grab" && isMovableDisplayLabel(item.label)) || null;
+  const targetLatchObjectKey = (() => {
+    if (firstLiveGrabBlob) {
+      return `label:${firstLiveGrabBlob.label}`;
+    }
+    return "";
+  })();
+  useEffect(() => {
+    if (!targetLatchObjectKey || !firstLiveTargetBlob) return;
+    setLatchedTargetByObject((prev) => ({
+      ...prev,
+      [targetLatchObjectKey]: {
+        ...firstLiveTargetBlob,
+        updatedAtMs: uiNowMs,
+      },
+    }));
+  }, [
+    targetLatchObjectKey,
+    uiNowMs,
+    firstLiveTargetBlob?.label,
+    firstLiveTargetBlob?.x1,
+    firstLiveTargetBlob?.y1,
+    firstLiveTargetBlob?.x2,
+    firstLiveTargetBlob?.y2,
+    firstLiveTargetBlob?.score,
+  ]);
+  const latchedTargetForObject = targetLatchObjectKey ? latchedTargetByObject[targetLatchObjectKey] : null;
+  const latchedTargetForObjectFresh = Boolean(
+    latchedTargetForObject
+    && uiNowMs - Number(latchedTargetForObject.updatedAtMs ?? 0) <= TARGET_ATTENTION_LATCH_MS
+  );
   const sceneTimelineCue = SCENE_TIMELINE_CUE_ENABLED && isEmbodiedMode && embodiedVideoSource === "scene" && sceneVideoFile === "scene_sophie.mp4"
     ? SOPHIE_SCENE_TIMELINE.find((event) => sceneVideoTimeS >= event.grabStartS - 1.2 && sceneVideoTimeS <= event.releaseS + 0.8)
     : null;
@@ -1196,7 +1404,24 @@ export default function Home() {
       ]
     : [];
   const visiblePlanningAttentionBlobs = planningFreshEnough
-    ? (planningAttentionBlobs.length > 0 ? planningAttentionBlobs : sceneTimelineAttentionBlobs)
+    ? (
+        planningAttentionBlobs.length > 0
+          ? (
+              !planningAttentionBlobs.some((item) => item.kind === "place" && isTargetDisplayLabel(item.label))
+              && latchedTargetForObjectFresh
+                ? [
+                    ...planningAttentionBlobs,
+                    {
+                      ...latchedTargetForObject,
+                      id: `place-latched-${targetLatchObjectKey}-${latchedTargetForObject.label}`,
+                      kind: "place" as const,
+                      score: Math.max(0.72, Math.min(0.94, Number(latchedTargetForObject.score ?? 0.78) * 0.96)),
+                    },
+                  ]
+                : planningAttentionBlobs
+            )
+          : sceneTimelineAttentionBlobs
+      )
     : sceneTimelineAttentionBlobs;
   const attentionHasReadableTarget = visiblePlanningAttentionBlobs.some((item) => item.kind === "place" && isTargetDisplayLabel(item.label));
   const attentionHasReadableGrab = visiblePlanningAttentionBlobs.some((item) => item.kind === "grab" && isMovableDisplayLabel(item.label));
@@ -1219,7 +1444,7 @@ export default function Home() {
   const primaryGrab = displayedPlanningAttentionBlobs.find((item) => item.kind === "grab") || null;
   const primaryPlace = displayedPlanningAttentionBlobs.find((item) => item.kind === "place") || null;
   const activeHeldInteraction = handInteractionsData.find((item: any) => {
-    if (!Boolean(item?.learned_is_held || item?.is_contacting || item?.is_touching_strict)) return false;
+    if (!trustedContactLike(item)) return false;
     const label = heldLabelForInteraction(item);
     return isMovableDisplayLabel(label);
   }) || null;
@@ -1344,7 +1569,18 @@ export default function Home() {
             updatedAtMs: uiNowMs,
             score: intentScore,
           }
-        : null));
+        : (GEOMETRIC_FALLBACK_CUE_ENABLED && fallbackHandObjectCue && isTargetDisplayLabel(String(fallbackHandObjectCue.targetLabel || ""))
+          ? {
+              phase: "PREDICTING",
+              caption: `likely: ${fallbackHandObjectCue.objectLabel} -> ${fallbackHandObjectCue.targetLabel}`,
+              objectLabel: String(fallbackHandObjectCue.objectLabel || "object"),
+              targetLabel: String(fallbackHandObjectCue.targetLabel || "target"),
+              objectId: String(fallbackHandObjectCue.objectId || ""),
+              eventState: "predicting",
+              updatedAtMs: uiNowMs,
+              score: Math.round(Math.max(0, Math.min(1, Number(fallbackHandObjectCue.score || 0))) * 100),
+            }
+          : null)));
   const liveIntentHasObject = Boolean(liveIntentCue && isMovableDisplayLabel(liveIntentCue.objectLabel));
   const liveIntentHasTarget = Boolean(liveIntentCue && (liveIntentCue.eventState === "released" || isTargetDisplayLabel(liveIntentCue.targetLabel)));
   const liveIntentReadable = Boolean(liveIntentCue && liveIntentHasObject && liveIntentHasTarget);
@@ -1371,6 +1607,7 @@ export default function Home() {
   useEffect(() => {
     if (!liveIntentReadable || !liveIntentCue) return;
     if (!useWebSpeechDebug || !isEmbodiedMode) return;
+    if (useAvatarSpeech) return;
     const state = String(liveIntentCue.eventState || "");
     if (!["predicting", "held", "releasing", "released"].includes(state)) return;
     const objectLabel = normalizeDisplayLabel(String(liveIntentCue.objectLabel || ""));
@@ -1397,6 +1634,7 @@ export default function Home() {
     liveIntentCue?.objectLabel,
     liveIntentCue?.targetLabel,
     useWebSpeechDebug,
+    useAvatarSpeech,
     isEmbodiedMode,
   ]);
 
@@ -1493,6 +1731,7 @@ export default function Home() {
     setWorldDebugText("");
     setWorldDebugDataState({});
     setDepthDebugUrl("");
+    setLatchedTargetByObject({});
     setRefinedLabelsById({});
     setRefinedLabelsByHint(DEBUG_LABEL_HINTS);
     try {
@@ -2314,17 +2553,18 @@ export default function Home() {
             const guidanceDelayMs = Number.isFinite(sourceFrameTs) ? Math.max(0, Date.now() - sourceFrameTs) : null;
             const isGroundedMode = mode === "grabbed" || mode === "released" || mode === "releasing" || mode === "approach" || mode === "hand_detected";
             const isFreshGuidance = guidanceDelayMs === null
-              || guidanceDelayMs <= WORLD_STATE_ACTIONABLE_MAX_MS
-              || isGroundedMode;
+              || guidanceDelayMs <= WORLD_STATE_ACTIONABLE_MAX_MS;
             const isFreshRelease = mode !== "released" || !Number.isFinite(eventAgeS) || eventAgeS <= RELEASED_SPEECH_EVENT_MAX_S;
             const isFreshGrab = mode !== "grabbed" || !Number.isFinite(contactAgeS) || contactAgeS <= GRABBED_SPEECH_CONTACT_MAX_S;
+            const recentDirectGroundedCue = now - Number(lastDirectWorldCueRef.current.timeMs || 0) < 4500;
 
             const shouldSkipRepeatedStop = base === "stop" && lastBase === "stop";
+            const shouldSkipHandOnlyCue = mode === "hand_detected" && recentDirectGroundedCue;
             const changed = base !== lastBase;
             const enoughTime = now - last > (mode === "hand_detected" ? 3500 : 1400);
             const repeatGroundedCue = mode !== "hand_detected" && now - last > 5200;
 
-            if (isGroundedMode && isFreshGuidance && isFreshRelease && isFreshGrab && !shouldSkipRepeatedStop && enoughTime && (changed || repeatGroundedCue)) {
+            if (isGroundedMode && isFreshGuidance && isFreshRelease && isFreshGrab && !shouldSkipRepeatedStop && !shouldSkipHandOnlyCue && enoughTime && (changed || repeatGroundedCue)) {
               maybeSpeakWorldModelExplanation(text);
               if (guidanceDelayMs !== null) {
                 setEventLog((prev) =>
@@ -2727,7 +2967,7 @@ export default function Home() {
     if (!localCamRef.current) return;
 
     const video = localCamRef.current;
-    const maxCaptureWidth = 384;
+    const maxCaptureWidth = embodiedVideoSource === "scene" ? 320 : 384;
 
     if (!frameCanvasRef.current) {
       frameCanvasRef.current = document.createElement("canvas");
@@ -2807,7 +3047,7 @@ export default function Home() {
           capture_ms: t1 - t0,
         })
       );
-    }, 100);
+    }, embodiedVideoSource === "scene" ? 180 : 120);
   }
 
   function stopLocalCamera() {
@@ -2876,8 +3116,16 @@ export default function Home() {
     const speakInBrowser = () => {
       if (!("speechSynthesis" in window)) {
         setStatus("Browser audio is not available in this browser");
+        setEventLog((prev) =>
+          [`[BROWSER SPEECH ERROR] speechSynthesis unavailable: ${text}`, prev]
+            .filter(Boolean)
+            .join("\n\n")
+            .slice(0, 4000)
+        );
         return;
       }
+      const speechSeq = browserSpeechSeqRef.current + 1;
+      browserSpeechSeqRef.current = speechSeq;
       const utter = new SpeechSynthesisUtterance(text);
       utter.rate = 1.25;
       utter.lang = "en-US";
@@ -2887,7 +3135,43 @@ export default function Home() {
         voices.find((voice) => voice.lang === "en-US") ||
         voices.find((voice) => voice.lang.toLowerCase().startsWith("en-"));
       if (preferredVoice) utter.voice = preferredVoice;
-      window.speechSynthesis.cancel();
+      utter.onstart = () => {
+        setStatus(`Browser audio speaking: ${text}`);
+        setEventLog((prev) =>
+          [`[BROWSER SPEECH START #${speechSeq}] ${text}`, prev]
+            .filter(Boolean)
+            .join("\n\n")
+            .slice(0, 4000)
+        );
+      };
+      utter.onend = () => {
+        setEventLog((prev) =>
+          [`[BROWSER SPEECH END #${speechSeq}] ${text}`, prev]
+            .filter(Boolean)
+            .join("\n\n")
+            .slice(0, 4000)
+        );
+      };
+      utter.onerror = (err) => {
+        const error = String((err as any)?.error || "unknown");
+        setStatus(`Browser audio error: ${error}`);
+        setEventLog((prev) =>
+          [`[BROWSER SPEECH ERROR #${speechSeq}] ${error}: ${text}`, prev]
+            .filter(Boolean)
+            .join("\n\n")
+            .slice(0, 4000)
+        );
+      };
+      setEventLog((prev) =>
+        [`[BROWSER SPEECH QUEUED #${speechSeq}] ${text}`, prev]
+          .filter(Boolean)
+          .join("\n\n")
+          .slice(0, 4000)
+      );
+      window.speechSynthesis.resume();
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+        window.speechSynthesis.cancel();
+      }
       window.speechSynthesis.speak(utter);
     };
 
@@ -3647,7 +3931,7 @@ export default function Home() {
                 const len = Math.sqrt(dx * dx + dy * dy);
                 const angle = Math.atan2(dy, dx) * 180 / Math.PI;
                 const alpha = Math.max(0.22, Math.min(0.9, ln.score * 0.9));
-                const color = ln.kind === "grab" ? `rgba(245,158,11,${alpha})` : `rgba(6,182,212,${alpha})`;
+                const color = ln.kind === "grab" ? `rgba(6,182,212,${alpha})` : `rgba(245,158,11,${alpha})`;
                 return (
                   <div
                     key={`planning-${ln.id}`}
@@ -3671,13 +3955,19 @@ export default function Home() {
               {isEmbodiedMode && displayedPlanningAttentionBlobs.map((item) => {
                 const left = ((item.x1 + item.x2) * 0.5) * 100;
                 const top = ((item.y1 + item.y2) * 0.5) * 100;
-                const w = Math.max(item.kind === "place" ? 34 : 28, (item.x2 - item.x1) * (item.kind === "place" ? 285 : 220));
-                const h = Math.max(item.kind === "place" ? 34 : 28, (item.y2 - item.y1) * (item.kind === "place" ? 285 : 220));
+                const rawW = Math.max(0, (item.x2 - item.x1) * 100);
+                const rawH = Math.max(0, (item.y2 - item.y1) * 100);
                 const score = Math.max(0, Math.min(1, item.score));
                 const isGrab = item.kind === "grab";
+                const w = isGrab
+                  ? Math.max(8, Math.min(34, rawW * 1.03))
+                  : Math.max(28, Math.min(62, rawW * 1.08));
+                const h = isGrab
+                  ? Math.max(8, Math.min(40, rawH * 1.03))
+                  : Math.max(28, Math.min(62, rawH * 1.08));
                 const fill = isGrab
-                  ? `radial-gradient(ellipse at center, rgba(255,247,210,${0.20 + 0.24 * score}) 0%, rgba(245,158,11,${0.38 + 0.38 * score}) 24%, rgba(245,158,11,${0.18 + 0.24 * score}) 56%, rgba(245,158,11,0) 84%)`
-                  : `radial-gradient(ellipse at center, rgba(207,250,254,${0.20 + 0.22 * score}) 0%, rgba(6,182,212,${0.36 + 0.36 * score}) 26%, rgba(6,182,212,${0.16 + 0.24 * score}) 58%, rgba(6,182,212,0) 86%)`;
+                  ? "transparent"
+                  : `radial-gradient(ellipse at center, rgba(255,247,210,${0.20 + 0.24 * score}) 0%, rgba(245,158,11,${0.38 + 0.38 * score}) 24%, rgba(245,158,11,${0.18 + 0.24 * score}) 56%, rgba(245,158,11,0) 84%)`;
                 return (
                   <div
                     key={`planning-attention-${item.id}`}
@@ -3693,22 +3983,24 @@ export default function Home() {
                         ? Math.max(0.18, planningFreshness * (item === primaryAttention ? 1 : 0.8))
                         : Math.max(0.32, planningFreshness * 0.95),
                       transition: "left 180ms linear, top 180ms linear, width 180ms linear, height 180ms linear, opacity 220ms ease",
-                      zIndex: isGrab ? (item === primaryAttention ? 9 : 8) : 10,
+                      zIndex: isGrab ? (item === primaryAttention ? 11 : 10) : 9,
                     }}
                   >
-                    <div style={{ position: "absolute", inset: "-14%", borderRadius: 999, background: fill, filter: "blur(10px)" }} />
-                    <div
-                      style={{
-                        position: "absolute",
-                        inset: "10%",
-                        borderRadius: 999,
-                        border: `2px solid ${isGrab ? "rgba(245,158,11,0.78)" : "rgba(6,182,212,0.82)"}`,
-                        boxShadow: isGrab
-                          ? "0 0 22px rgba(245,158,11,0.55), inset 0 0 18px rgba(245,158,11,0.18)"
-                          : "0 0 26px rgba(6,182,212,0.65), inset 0 0 20px rgba(6,182,212,0.22)",
-                        background: isGrab ? "rgba(245,158,11,0.08)" : "rgba(6,182,212,0.10)",
-                      }}
-                    />
+                    {!isGrab ? (
+                      <div style={{ position: "absolute", inset: "-14%", borderRadius: 14, background: fill, filter: "blur(10px)" }} />
+                    ) : null}
+                    {isGrab ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          inset: "0%",
+                          borderRadius: 3,
+                          border: "2px solid rgba(6,182,212,0.82)",
+                          boxShadow: "0 0 16px rgba(6,182,212,0.58)",
+                          background: "rgba(6,182,212,0.03)",
+                        }}
+                      />
+                    ) : null}
                     {false && item === primaryAttention ? (
                       <div
                         style={{
@@ -3720,7 +4012,7 @@ export default function Home() {
                           borderRadius: "50%",
                           transform: "translate(-50%, -50%)",
                           background: "rgba(255,255,255,0.82)",
-                          boxShadow: isGrab ? "0 0 22px rgba(245,158,11,0.95)" : "0 0 22px rgba(6,182,212,0.95)",
+                          boxShadow: isGrab ? "0 0 22px rgba(6,182,212,0.95)" : "0 0 22px rgba(245,158,11,0.95)",
                         }}
                       />
                     ) : null}
@@ -3730,15 +4022,15 @@ export default function Home() {
                         display: "flex",
                         alignItems: "center",
                         gap: 6,
-                        left: "50%",
-                        top: isGrab ? "4%" : "82%",
-                        transform: "translateX(-50%)",
+                        left: isGrab ? 0 : "50%",
+                        top: isGrab ? -30 : "82%",
+                        transform: isGrab ? "none" : "translateX(-50%)",
                         maxWidth: "92%",
                         padding: "6px 9px",
                         borderRadius: 8,
-                        background: isGrab ? "rgba(120,53,15,0.92)" : "rgba(8,47,73,0.92)",
+                        background: isGrab ? "rgba(8,47,73,0.92)" : "rgba(120,53,15,0.92)",
                         color: "#ffffff",
-                        border: `1px solid ${isGrab ? "rgba(253,230,138,0.80)" : "rgba(165,243,252,0.80)"}`,
+                        border: `1px solid ${isGrab ? "rgba(165,243,252,0.80)" : "rgba(253,230,138,0.80)"}`,
                         fontSize: 12,
                         fontWeight: 900,
                         whiteSpace: "nowrap",
@@ -3746,7 +4038,7 @@ export default function Home() {
                         boxShadow: "0 10px 22px rgba(2,6,23,0.36)",
                       }}
                     >
-                      <span>{isGrab ? "grab" : "destination"}</span>
+                      <span>{isGrab ? "grab" : "target"}</span>
                       <span style={{ opacity: 0.84 }}>{item.label}</span>
                       <span style={{ opacity: 0.72 }}>{Math.round(score * 100)}%</span>
                     </div>
@@ -3809,12 +4101,12 @@ export default function Home() {
                   }}
                 >
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ width: 9, height: 9, borderRadius: 999, background: "#f59e0b", boxShadow: "0 0 10px rgba(245,158,11,0.8)" }} />
+                    <span style={{ width: 9, height: 9, borderRadius: 999, background: "#06b6d4", boxShadow: "0 0 10px rgba(6,182,212,0.8)" }} />
                     grab
                   </span>
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ width: 9, height: 9, borderRadius: 999, background: "#06b6d4", boxShadow: "0 0 10px rgba(6,182,212,0.8)" }} />
-                    place
+                    <span style={{ width: 9, height: 9, borderRadius: 999, background: "#f59e0b", boxShadow: "0 0 10px rgba(245,158,11,0.8)" }} />
+                    target
                   </span>
                   <span style={{ color: "rgba(255,255,255,0.72)" }}>
                     {displayedFrameAgeMs == null ? "syncing" : (displayedFrameAgeMs > 1600 ? `stale ${Math.max(0, displayedFrameAgeMs)} ms` : `${Math.max(0, displayedFrameAgeMs)} ms`)}
@@ -4749,7 +5041,7 @@ export default function Home() {
                       const len = Math.sqrt(dx * dx + dy * dy);
                       const angle = Math.atan2(dy, dx) * 180 / Math.PI;
                       const alpha = Math.max(0.18, Math.min(0.85, ln.score * 0.85));
-                      const color = ln.kind === "grab" ? `rgba(251,113,133,${alpha})` : `rgba(74,222,128,${alpha})`;
+                      const color = ln.kind === "grab" ? `rgba(6,182,212,${alpha})` : `rgba(245,158,11,${alpha})`;
                       return (
                         <div
                           key={ln.id}
@@ -4772,14 +5064,17 @@ export default function Home() {
                     {displayedPlanningAttentionBlobs.map((item) => {
                       const left = ((item.x1 + item.x2) * 0.5) * 100;
                       const top = ((item.y1 + item.y2) * 0.5) * 100;
-                      const w = Math.max(8, (item.x2 - item.x1) * 130);
-                      const h = Math.max(8, (item.y2 - item.y1) * 130);
+                      const rawW = Math.max(0, (item.x2 - item.x1) * 100);
+                      const rawH = Math.max(0, (item.y2 - item.y1) * 100);
                       const score = Math.max(0, Math.min(1, item.score));
-                      const ring = item.kind === "grab" ? "rgba(251,113,133,0.78)" : "rgba(74,222,128,0.78)";
+                      const isGrab = item.kind === "grab";
+                      const w = Math.max(isGrab ? 8 : 12, Math.min(isGrab ? 34 : 46, rawW * (isGrab ? 1.1 : 1.05)));
+                      const h = Math.max(isGrab ? 8 : 12, Math.min(isGrab ? 34 : 46, rawH * (isGrab ? 1.1 : 1.05)));
+                      const ring = isGrab ? "rgba(6,182,212,0.78)" : "rgba(245,158,11,0.78)";
                       const badge = item.kind === "grab" ? "grab next" : "place target";
                       const glow = item.kind === "grab"
-                        ? `radial-gradient(ellipse at center, rgba(251,113,133,${0.32 + 0.36 * score}) 0%, rgba(251,113,133,${0.14 + 0.22 * score}) 42%, rgba(251,113,133,0) 82%)`
-                        : `radial-gradient(ellipse at center, rgba(74,222,128,${0.30 + 0.34 * score}) 0%, rgba(74,222,128,${0.14 + 0.20 * score}) 44%, rgba(74,222,128,0) 84%)`;
+                        ? `radial-gradient(ellipse at center, rgba(6,182,212,${0.32 + 0.36 * score}) 0%, rgba(6,182,212,${0.14 + 0.22 * score}) 42%, rgba(6,182,212,0) 82%)`
+                        : `radial-gradient(ellipse at center, rgba(245,158,11,${0.30 + 0.34 * score}) 0%, rgba(245,158,11,${0.14 + 0.20 * score}) 44%, rgba(245,158,11,0) 84%)`;
                       return (
                         <div key={item.id} style={{ position: "absolute", left: `${left}%`, top: `${top}%`, width: `${Math.max(w, 8)}%`, height: `${Math.max(h, 8)}%`, transform: "translate(-50%, -50%)", pointerEvents: "none", zIndex: 11 }}>
                           <div style={{ position: "absolute", inset: "-18%", borderRadius: 999, background: glow, filter: "blur(4px)" }} />

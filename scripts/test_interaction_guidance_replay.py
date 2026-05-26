@@ -117,6 +117,35 @@ def main():
     state.objects["obj_bottle"]["position_3d"] = [0.6, 0.0, 0.0]
     scenarios.append({"name": "grab_baby_bottle_from_coaster_predict_mat", "guidance": build_interaction_guidance(state)})
 
+    state.objects = {
+        "obj_bottle": {"id": "obj_bottle", "label": "baby bottle", "position_3d": [0.6, 0.0, 0.0]},
+        "obj_giraffe": {"id": "obj_giraffe", "label": "toy giraffe", "position_3d": [0.02, 0.0, 0.0]},
+    }
+    state.static_targets = {
+        "target_mat": {"id": "target_mat", "label": "mat", "locked": True, "position_3d": [0.02, 0.0, 0.0]},
+        "target_tray": {"id": "target_tray", "label": "tray", "locked": True, "position_3d": [0.6, 0.0, 0.0]},
+    }
+    state.hand_object_interactions = [{
+        "hand_id": "hand_right",
+        "nearest_object_id": "obj_bottle",
+        "nearest_object_label": "baby bottle",
+        "held_object_id": "obj_giraffe",
+        "held_object_label": "toy giraffe",
+        "learned_object_id": "obj_giraffe",
+        "learned_target_label": "tray",
+        "learned_is_held": True,
+        "distance_m": 0.04,
+        "is_contacting": True,
+        "intent_grab_candidates": [],
+        "intent_place_candidates": [],
+    }]
+    state.hand_contact_events = [{"event": "contact_start", "object_id": "obj_giraffe", "label": "toy giraffe"}]
+    state.manipulation_events = []
+    owner_guidance = build_interaction_guidance(state)
+    if owner_guidance.get("details", {}).get("object") != "toy giraffe":
+        raise AssertionError(f"held owner regression: {owner_guidance}")
+    scenarios.append({"name": "held_owner_beats_nearest_object", "guidance": owner_guidance})
+
     pick_place_events = validation.get("pick_place_events", [])
     if pick_place_events:
         state.hand_object_interactions = []

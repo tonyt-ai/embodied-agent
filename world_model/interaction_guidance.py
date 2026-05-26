@@ -293,7 +293,10 @@ def build_interaction_guidance(world_state):
             temporal_contact = float(item.get("pred_contact_prob", 0.0) or 0.0) >= 0.50
         except (TypeError, ValueError):
             temporal_contact = False
-        if bool(item.get("learned_is_held", False)) or bool(item.get("is_contacting", False)) or bool(item.get("is_touching_strict", False)) or temporal_contact:
+        raw_contact = bool(item.get("is_contacting", False))
+        if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie":
+            raw_contact = False
+        if bool(item.get("learned_is_held", False)) or raw_contact or bool(item.get("is_touching_strict", False)) or temporal_contact:
             active = item
             break
 
@@ -302,10 +305,20 @@ def build_interaction_guidance(world_state):
     details = {}
 
     if active is not None:
+        active_object_id = (
+            active.get("held_object_id")
+            or active.get("learned_object_id")
+            or active.get("nearest_object_id")
+        )
+        active_object_label = (
+            active.get("held_object_label")
+            or active.get("nearest_object_label")
+            or "object"
+        )
         obj_label = object_label_by_id(
             world_state,
-            active.get("nearest_object_id"),
-            active.get("nearest_object_label", "object"),
+            active_object_id,
+            active_object_label,
         )
         if not is_movable_label(obj_label):
             active = None
@@ -313,7 +326,7 @@ def build_interaction_guidance(world_state):
             preferred_target = preferred_target_for_cue(
                 obj_label,
                 world_state,
-                active.get("nearest_object_id"),
+                active_object_id,
                 active,
             )
             release_prob = 0.0
@@ -350,7 +363,7 @@ def build_interaction_guidance(world_state):
             if mode != "releasing":
                 mode = "grabbed"
             details["object"] = obj_label
-            details["object_id"] = active.get("nearest_object_id")
+            details["object_id"] = active_object_id
 
     if explanation is None and release_speech_enabled and recent_event is not None:
         obj_label = object_label_by_id(world_state, recent_event.get("object_id"), recent_event.get("label", "object"))

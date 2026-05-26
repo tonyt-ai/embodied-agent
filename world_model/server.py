@@ -53,6 +53,7 @@ from semantic_stabilizer import SemanticStabilizer, build_foreground_mask
 from slam_backend import create_slam_backend
 from ultralytics import YOLO
 from world_state import WorldState
+from sophie_visual_tracker import SophieVisualTracker
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -166,6 +167,10 @@ PERCEPTION_UNMATCHED_SEG_MAX = int(os.environ.get("PERCEPTION_UNMATCHED_SEG_MAX"
 PERCEPTION_UNMATCHED_SEG_MIN_CONF = float(os.environ.get("PERCEPTION_UNMATCHED_SEG_MIN_CONF", "0.15"))
 PERCEPTION_UNMATCHED_SEG_MIN_AREA = float(os.environ.get("PERCEPTION_UNMATCHED_SEG_MIN_AREA", "0.004"))
 PERCEPTION_UNMATCHED_SEG_MAX_AREA = float(os.environ.get("PERCEPTION_UNMATCHED_SEG_MAX_AREA", "0.25"))
+SOPHIE_DINO_REID_ENABLED = os.environ.get("SOPHIE_DINO_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
+SOPHIE_DINO_REID_MAX_CANDIDATES = int(os.environ.get("SOPHIE_DINO_REID_MAX_CANDIDATES", "12"))
+SOPHIE_DINO_REID_MIN_SIM = float(os.environ.get("SOPHIE_DINO_REID_MIN_SIM", "0.70"))
+SOPHIE_DINO_REID_MIN_MARGIN = float(os.environ.get("SOPHIE_DINO_REID_MIN_MARGIN", "0.04"))
 SEMANTIC_ENABLED = os.environ.get("SLAM_SEMANTIC_STABILIZATION", "1").lower() not in {"0", "false", "no"}
 SEMANTIC_DINO_DIM = int(os.environ.get("SLAM_SEMANTIC_DINO_DIM", "48"))
 SEMANTIC_DINO_UPDATE_EVERY = int(os.environ.get("SLAM_SEMANTIC_DINO_UPDATE_EVERY", "6"))
@@ -264,6 +269,7 @@ OPEN_VOCAB_STATUS = _configure_open_vocab_detector_classes()
 last_dino_embedding = [0.0] * DINO_DIM
 dino_frame_counter = 0
 semantic_dino_frame_counter = 0
+sophie_visual_tracker = SophieVisualTracker() if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie" else None
 
 # State used for collecting transitions across frames
 prev_state_vec = None
@@ -300,7 +306,7 @@ DEMO_MIN_INTERACTION_SCORE = float(os.environ.get("DEMO_MIN_INTERACTION_SCORE", 
 
 def reset_runtime_state():
     """Reset transient world-model state between repeatable debug runs."""
-    global state, prev_state_vec, prev_move_vec, last_interaction_event_count, last_dino_embedding, dino_frame_counter, semantic_dino_frame_counter
+    global state, prev_state_vec, prev_move_vec, last_interaction_event_count, last_dino_embedding, dino_frame_counter, semantic_dino_frame_counter, sophie_visual_tracker
 
     state = WorldState(collection_mode=COLLECT_TRANSITIONS)
     slam_backend.reset()
@@ -313,6 +319,7 @@ def reset_runtime_state():
     last_dino_embedding = [0.0] * DINO_DIM
     dino_frame_counter = 0
     semantic_dino_frame_counter = 0
+    sophie_visual_tracker = SophieVisualTracker() if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie" else None
 
 
 def sanitize_for_json(value):
@@ -597,6 +604,76 @@ def _nonzero_embedding(emb) -> bool:
         return False
 
 
+def _cosine_embedding(a, b) -> float:
+    if not isinstance(a, list) or not isinstance(b, list) or not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    try:
+        av = np.asarray(a[:n], dtype=np.float32)
+        bv = np.asarray(b[:n], dtype=np.float32)
+        denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
+        if denom <= 1e-8:
+            return 0.0
+        return float(np.clip(np.dot(av, bv) / denom, -1.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _bbox_area_norm(bbox) -> float:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return 0.0
+    try:
+        return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sophie_identity_prototypes():
+    """Return persistent DINO prototypes for Sophie objects from WorldState."""
+    if os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() != "sophie":
+        return {}
+    prototypes = {}
+    objects = getattr(state, "objects", {}) if state is not None else {}
+    for obj in objects.values():
+        label = normalize_label(
+            obj.get("scene_memory_label")
+            or obj.get("semantic_label")
+            or obj.get("label")
+            or obj.get("raw_label")
+            or ""
+        )
+        visual = str(obj.get("visual_identity_class") or "").strip().lower()
+        if visual == "baby_bottle":
+            label = "baby bottle"
+        elif visual == "toy_giraffe":
+            label = "toy giraffe"
+        if label not in {"baby bottle", "toy giraffe"}:
+            continue
+        emb = obj.get("dino_embedding") or (obj.get("embedding") if str(obj.get("embedding_source", "")).lower() == "dino" else [])
+        if not _nonzero_embedding(emb):
+            continue
+        prototypes.setdefault(label, []).append(emb)
+    out = {}
+    for label, embeds in prototypes.items():
+        arrs = []
+        for emb in embeds[-8:]:
+            try:
+                arr = np.asarray(emb, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                if norm > 1e-8:
+                    arrs.append(arr / norm)
+            except Exception:
+                continue
+        if arrs:
+            proto = np.mean(np.stack(arrs, axis=0), axis=0)
+            norm = float(np.linalg.norm(proto))
+            if norm > 1e-8:
+                out[label] = (proto / norm).astype(np.float32).tolist()
+    return out
+
+
 def _crop_luma_mean(frame: np.ndarray, bbox_norm) -> float | None:
     if frame is None or not hasattr(frame, "shape") or not bbox_norm or len(bbox_norm) < 4:
         return None
@@ -632,6 +709,41 @@ def _should_track_object_label(label: str) -> bool:
     if not TRACKED_OBJECT_LABELS:
         return True
     return norm in TRACKED_OBJECT_LABELS
+
+
+def _candidate_to_tracked_object(frame, candidate, label, confidence=None, *, source_suffix=""):
+    bbox = candidate.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return None
+    cx = (float(bbox[0]) + float(bbox[2])) * 0.5
+    cy = (float(bbox[1]) + float(bbox[3])) * 0.5
+    hsv_embedding = _encode_fast_crop_embedding(frame, bbox, out_dim=DINO_DIM)
+    luma = _crop_luma_mean(frame, bbox)
+    norm_label = normalize_label(label)
+    visual_class = ""
+    if norm_label == "toy giraffe":
+        visual_class = "toy_giraffe"
+    elif norm_label == "baby bottle":
+        visual_class = "baby_bottle"
+    item = {
+        "label": norm_label,
+        "raw_label": candidate.get("label", norm_label),
+        "x": round(float(cx), 3),
+        "y": round(float(cy), 3),
+        "bbox": bbox,
+        "confidence": round(float(confidence if confidence is not None else candidate.get("confidence", 0.0) or 0.0), 3),
+        "embedding": hsv_embedding,
+        "embedding_source": "hsv",
+        "hsv_embedding": hsv_embedding,
+        "dino_embedding": [],
+        "mask_polygon": candidate.get("mask_polygon") or default_bbox_polygon(bbox),
+        "segmentation_source": candidate.get("segmentation_source", "bbox") + source_suffix,
+        "crop_luma_mean": luma,
+    }
+    if visual_class:
+        item["visual_identity_class"] = visual_class
+        item["semantic_label"] = norm_label
+    return item
 
 
 def _normalize_polygon(points_xy, w: int, h: int, max_points: int = 32):
@@ -840,7 +952,7 @@ def _collect_unmatched_segmentation_candidates(detector_candidates, segmentation
 
 def detect_cup_and_semantic_candidates(frame):
     """Run detector + optional segmenter and return tracked objects + semantic candidates."""
-    global last_dino_embedding, dino_frame_counter, semantic_dino_frame_counter
+    global last_dino_embedding, dino_frame_counter, semantic_dino_frame_counter, sophie_visual_tracker
 
     semantic_candidates = build_semantic_candidates(
         frame,
@@ -893,6 +1005,127 @@ def detect_cup_and_semantic_candidates(frame):
         })
         if len(tracked_objects) >= max(1, MAX_TRACKED_OBJECTS):
             break
+
+    # Sophie-specific persistent identity re-ID:
+    # YOLO/FastSAM proposes current-frame boxes/masks, DINO decides whether a
+    # proposal matches the remembered baby bottle or toy giraffe identity. This
+    # is not a label alias and not a two-pass render; it is online object memory.
+    if SOPHIE_DINO_REID_ENABLED and USE_DINO_EMBEDDING and os.environ.get("DEMO_SCENE_PROFILE", "").strip().lower() == "sophie":
+        prototypes = _sophie_identity_prototypes()
+        if prototypes:
+            reid_matches = []
+            candidate_pool = sorted(
+                semantic_candidates,
+                key=lambda item: (
+                    str(item.get("segmentation_source", "")) != "bbox",
+                    float(item.get("confidence", 0.0) or 0.0),
+                    _bbox_area_norm(item.get("bbox")),
+                ),
+                reverse=True,
+            )
+            encoded = 0
+            for candidate in candidate_pool:
+                bbox = candidate.get("bbox")
+                area = _bbox_area_norm(bbox)
+                if not bbox or area < 0.001 or area > 0.34:
+                    continue
+                raw_label = normalize_label(candidate.get("label", ""))
+                if raw_label in TRACKED_STATIC_TARGET_LABELS or raw_label in TRACKED_OBJECT_LABEL_DENYLIST:
+                    continue
+                try:
+                    emb = encode_bbox(frame, bbox, out_dim=DINO_DIM)
+                except Exception:
+                    continue
+                if not _nonzero_embedding(emb):
+                    continue
+                encoded += 1
+                sims = {
+                    label: _cosine_embedding(emb, proto)
+                    for label, proto in prototypes.items()
+                }
+                if not sims:
+                    continue
+                label, sim = max(sims.items(), key=lambda kv: kv[1])
+                other = max([v for k, v in sims.items() if k != label] or [0.0])
+                margin = float(sim) - float(other)
+                if sim < SOPHIE_DINO_REID_MIN_SIM or margin < SOPHIE_DINO_REID_MIN_MARGIN:
+                    continue
+                # Prefer actual masks over broad detector boxes; confidence is
+                # identity confidence, not detector class confidence.
+                score = float(sim) + 0.08 * min(1.0, float(candidate.get("confidence", 0.0) or 0.0))
+                if str(candidate.get("segmentation_source", "")) != "bbox":
+                    score += 0.04
+                reid_matches.append((score, label, sim, margin, emb, candidate))
+                if encoded >= max(1, SOPHIE_DINO_REID_MAX_CANDIDATES):
+                    break
+            for score, label, sim, margin, emb, candidate in sorted(reid_matches, key=lambda item: item[0], reverse=True):
+                replacement = _candidate_to_tracked_object(
+                    frame,
+                    candidate,
+                    label,
+                    confidence=max(float(candidate.get("confidence", 0.0) or 0.0), float(sim)),
+                    source_suffix="+dino_reid",
+                )
+                if replacement is None:
+                    continue
+                replacement["embedding"] = emb
+                replacement["embedding_source"] = "dino"
+                replacement["dino_embedding"] = emb
+                replacement["visual_identity_label"] = label
+                replacement["visual_identity_score"] = round(float(sim), 4)
+                replacement["visual_identity_margin"] = round(float(margin), 4)
+                replacement["semantic_label"] = label
+                replaced = False
+                for idx, item in enumerate(tracked_objects):
+                    if normalize_label(item.get("label", "")) == label or bbox_iou(item.get("bbox", [0, 0, 0, 0]), replacement["bbox"]) >= 0.18:
+                        tracked_objects[idx] = replacement
+                        replaced = True
+                        break
+                if not replaced and len(tracked_objects) < max(1, MAX_TRACKED_OBJECTS):
+                    tracked_objects.append(replacement)
+                if sophie_visual_tracker is not None:
+                    sophie_visual_tracker.observe(frame, label, replacement["bbox"])
+
+    if sophie_visual_tracker is not None:
+        try:
+            fps = float(os.environ.get("DEMO_VIDEO_FPS", "30.0"))
+        except ValueError:
+            fps = 30.0
+        t_s = float(dino_frame_counter) / max(1.0, fps)
+        visual_boxes = sophie_visual_tracker.update(frame, t_s=t_s)
+        for label, bbox in visual_boxes.items():
+            if not bbox:
+                continue
+            cx = (float(bbox[0]) + float(bbox[2])) * 0.5
+            cy = (float(bbox[1]) + float(bbox[3])) * 0.5
+            hsv_embedding = _encode_fast_crop_embedding(frame, bbox, out_dim=DINO_DIM)
+            luma = _crop_luma_mean(frame, bbox)
+            replacement = _candidate_to_tracked_object(
+                frame,
+                {
+                    "label": label,
+                    "bbox": bbox,
+                    "confidence": 0.72,
+                    "mask_polygon": default_bbox_polygon(bbox),
+                    "segmentation_source": "sophie_visual_tracker",
+                },
+                label,
+                confidence=0.72,
+            )
+            if replacement is None:
+                continue
+            replaced = False
+            for idx, item in enumerate(tracked_objects):
+                if normalize_label(item.get("label", "")) == label or bbox_iou(item.get("bbox", [0, 0, 0, 0]), bbox) >= 0.22:
+                    # Keep a DINO-confirmed mask over the appearance tracker;
+                    # otherwise the tracker carries the persistent label while
+                    # awaiting the next DINO-confirmed proposal.
+                    if str(item.get("embedding_source", "")).lower() != "dino":
+                        tracked_objects[idx] = replacement
+                    replaced = True
+                    break
+            if not replaced and len(tracked_objects) < max(1, MAX_TRACKED_OBJECTS):
+                tracked_objects.append(replacement)
 
     dino_frame_counter += 1
     fps = 30.0

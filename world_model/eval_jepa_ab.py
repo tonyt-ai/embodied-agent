@@ -142,7 +142,13 @@ def _run_once(video_path: str, *, use_jepa: bool):
             if hands:
                 hand_frames += 1
 
-            world_state.update(detections, camera_pose=pose, hands=hands, world_debug={}, sparse_map=pose.get("sparse_map", []))
+            world_state.update(
+                detections,
+                camera_pose=pose,
+                hands=hands,
+                world_debug={"intrinsics": intr},
+                sparse_map=pose.get("sparse_map", []),
+            )
             interactions = world_state.hand_object_interactions or []
             if interactions:
                 interactions_frames += 1
